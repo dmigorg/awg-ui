@@ -1,0 +1,875 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+source /usr/local/awg-ui/awg-common.sh
+
+readonly AWG_GEO_RULESET_VERSION="2026-06-10-snat-v1"
+
+function usage() {
+  cat <<EOF
+Usage:
+  awg-ui add <ip>           Add IP to NAT allow list
+  awg-ui del <ip>           Remove IP from NAT allow list
+  awg-ui list               Show allowed IP list
+
+  awg-ui sync               Sync UFW route rules from allow list
+  awg-ui apply              Apply NAT/MSS + UFW rules + geo bypass
+  awg-ui restart            Restart AmneziaWG and apply all rules
+  awg-ui status             Show full status
+
+  awg-ui geo-update         Download RU geo files and ru-whitelist CIDR list
+  awg-ui geo-apply          Apply nftables fwmark bypass
+  awg-ui geo-sync           geo-update + geo-apply
+  awg-ui geo-flush          Remove nftables table and policy routing
+  awg-ui geo-status         Show geo bypass status
+  awg-ui custom             Show custom CIDR file
+
+  awg-ui help               Show help
+
+Files:
+  allow list:     ${AWG_ALLOW_FILE}
+  custom bypass:  ${AWG_CUSTOM_CIDR}
+  awg config dir: ${AWG_CONFIG_DIR}
+  LAN CIDR:       ${AWG_LAN_CIDR}
+EOF
+}
+
+function add_ip() {
+  local ip
+  ip="$(awg_require_ip_arg "${1:-}")"
+
+  awg_prepare_dirs
+
+  if grep -Fxq "${ip}" "${AWG_ALLOW_FILE}"; then
+    awg_warn "IP already exists: ${ip}"
+  else
+    echo "${ip}" >> "${AWG_ALLOW_FILE}"
+    sort -V -u "${AWG_ALLOW_FILE}" -o "${AWG_ALLOW_FILE}"
+    chmod 600 "${AWG_ALLOW_FILE}"
+    awg_info "Added: ${ip}"
+  fi
+
+  ufw_sync
+}
+
+function del_ip() {
+  local ip
+  ip="$(awg_require_ip_arg "${1:-}")"
+
+  awg_prepare_dirs
+
+  if grep -Fxq "${ip}" "${AWG_ALLOW_FILE}"; then
+    grep -Fxv "${ip}" "${AWG_ALLOW_FILE}" > "${AWG_ALLOW_FILE}.tmp"
+    mv "${AWG_ALLOW_FILE}.tmp" "${AWG_ALLOW_FILE}"
+    chmod 600 "${AWG_ALLOW_FILE}"
+    awg_info "Deleted: ${ip}"
+  else
+    awg_warn "IP not found: ${ip}"
+  fi
+
+  ufw_sync
+}
+
+function list_ips() {
+  awg_prepare_dirs
+
+  echo "Allowed IPs from ${AWG_ALLOW_FILE}:"
+
+  if [[ ! -s "${AWG_ALLOW_FILE}" ]]; then
+    echo "  empty"
+    return 0
+  fi
+
+  nl -ba "${AWG_ALLOW_FILE}"
+}
+
+function ufw_delete_old_rules() {
+  local nums
+
+  nums="$(
+    ufw status numbered \
+      | sed -n "s/^\[\s*\([0-9]\+\)\].*${AWG_UFW_TAG}.*/\1/p" \
+      | sort -rn
+  )"
+
+  [[ -n "${nums}" ]] || return 0
+
+  while IFS= read -r num; do
+    [[ -z "${num}" ]] && continue
+    printf 'y\n' | ufw delete "${num}" >/dev/null
+  done <<< "${nums}"
+}
+
+function ufw_sync() {
+  local vpn_if
+  local lan_if
+  local ip
+  local return_if_file
+
+  awg_prepare_dirs
+  awg_check_ufw_commands
+
+  vpn_if="$(awg_detect_vpn_if)"
+  return_if_file="$(mktemp)"
+
+  awg_info "Detected VPN interface: ${vpn_if}"
+  awg_info "Syncing UFW rules..."
+
+  ufw_delete_old_rules
+
+  while IFS= read -r ip; do
+    [[ -z "${ip}" ]] && continue
+    [[ "${ip}" =~ ^# ]] && continue
+
+    if ! awg_is_valid_ipv4 "${ip}"; then
+      awg_warn "Skip invalid IPv4: ${ip}"
+      continue
+    fi
+
+    lan_if="$(awg_detect_lan_if_for_ip "${ip}")"
+
+    echo "${lan_if}" >> "${return_if_file}"
+
+    ufw route allow in on "${lan_if}" out on "${vpn_if}" from "${ip}" comment "${AWG_UFW_TAG} NAT ${ip}" >/dev/null
+    ufw route allow in on "${lan_if}" out on "${lan_if}" from "${ip}" comment "${AWG_UFW_TAG} bypass ${ip}" >/dev/null
+  done < "${AWG_ALLOW_FILE}"
+
+  sort -u "${return_if_file}" | while IFS= read -r lan_if; do
+    [[ -z "${lan_if}" ]] && continue
+    ufw route allow in on "${vpn_if}" out on "${lan_if}" comment "${AWG_UFW_TAG} return traffic ${lan_if}" >/dev/null
+  done
+
+  rm -f "${return_if_file}"
+
+  ufw reload >/dev/null
+
+  awg_info "UFW rules synced."
+  ufw status numbered | grep "${AWG_UFW_TAG}" || true
+}
+
+function firewall_delete_rule() {
+  local table="$1"
+  shift
+
+  while iptables -t "${table}" -C "$@" 2>/dev/null; do
+    iptables -t "${table}" -D "$@"
+  done
+}
+
+function firewall_apply_runtime() {
+  local vpn_if
+
+  awg_check_firewall_commands
+
+  vpn_if="$(awg_detect_vpn_if)"
+
+  if ! awg_is_valid_cidr_or_ip "${AWG_LAN_CIDR}"; then
+    awg_die "Invalid AWG_LAN_CIDR: ${AWG_LAN_CIDR}"
+  fi
+
+  awg_info "Applying NAT for ${AWG_LAN_CIDR} -> ${vpn_if}..."
+  firewall_delete_rule nat POSTROUTING -s "${AWG_LAN_CIDR}" -o "${vpn_if}" -j MASQUERADE
+  iptables -t nat -A POSTROUTING -s "${AWG_LAN_CIDR}" -o "${vpn_if}" -j MASQUERADE
+
+  awg_info "Applying TCPMSS clamp..."
+  modprobe xt_TCPMSS 2>/dev/null || true
+  firewall_delete_rule mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+function geo_update() {
+  awg_prepare_dirs
+  awg_check_update_commands
+
+  awg_info "Downloading RU geo files..."
+
+  curl -fL --retry 5 -o "${AWG_GEOIP_RU_DAT}.tmp" "${AWG_GEOIP_RU_URL}"
+  mv "${AWG_GEOIP_RU_DAT}.tmp" "${AWG_GEOIP_RU_DAT}"
+
+  curl -fL --retry 5 -o "${AWG_GEOSITE_RU_DAT}.tmp" "${AWG_GEOSITE_RU_URL}"
+  mv "${AWG_GEOSITE_RU_DAT}.tmp" "${AWG_GEOSITE_RU_DAT}"
+
+  awg_info "Downloading ru-whitelist CIDR list..."
+
+  curl -fL --retry 5 -o "${AWG_RU_WHITELIST_CIDR}.raw" "${AWG_RU_WHITELIST_URL}"
+
+  grep -Ev '^\s*$|^\s*#' "${AWG_RU_WHITELIST_CIDR}.raw" \
+    | sed 's/\r$//' \
+    | while IFS= read -r line; do
+        line="$(echo "${line}" | awk '{print $1}')"
+
+        if awg_is_valid_cidr_or_ip "${line}"; then
+          echo "${line}"
+        else
+          awg_warn "Skip invalid CIDR/IP: ${line}" >&2
+        fi
+      done \
+    | sort -V -u > "${AWG_RU_WHITELIST_CIDR}.tmp"
+
+  mv "${AWG_RU_WHITELIST_CIDR}.tmp" "${AWG_RU_WHITELIST_CIDR}"
+  rm -f "${AWG_RU_WHITELIST_CIDR}.raw"
+
+  chmod 600 "${AWG_GEOIP_RU_DAT}" "${AWG_GEOSITE_RU_DAT}" "${AWG_RU_WHITELIST_CIDR}"
+
+  rm -f "${AWG_NFT_HASH_FILE}"
+
+  awg_info "Geo files updated."
+  echo "RU whitelist CIDR count: $(wc -l < "${AWG_RU_WHITELIST_CIDR}")"
+}
+
+function geo_detect_bypass_src() {
+  local bypass_if="$1"
+  local bypass_src=""
+
+  bypass_src="$(
+    ip -4 addr show dev "${bypass_if}" scope global \
+      | awk '/inet / {print $2; exit}' \
+      | cut -d/ -f1
+  )"
+
+  [[ -n "${bypass_src}" ]] || awg_die "Cannot detect source IP for bypass interface: ${bypass_if}"
+
+  echo "${bypass_src}"
+}
+
+function geo_detect_vpn_src() {
+  local vpn_if="$1"
+  local vpn_src=""
+
+  vpn_src="$(
+    ip -4 addr show dev "${vpn_if}" scope global \
+      | awk '/inet / {print $2; exit}' \
+      | cut -d/ -f1
+  )"
+
+  [[ -n "${vpn_src}" ]] || awg_die "Cannot detect source IP for VPN interface: ${vpn_if}"
+
+  echo "${vpn_src}"
+}
+
+function geo_sources_hash() {
+  local vpn_if=""
+  local route_line=""
+  local bypass_if=""
+  local bypass_gw=""
+  local bypass_src=""
+  local vpn_src=""
+
+  awg_prepare_dirs
+
+  if vpn_if="$(awg_detect_vpn_if 2>/dev/null)"; then
+    route_line="$(awg_detect_bypass_route "${vpn_if}" 2>/dev/null || true)"
+    bypass_if="$(awg_route_line_to_dev "${route_line}" 2>/dev/null || true)"
+    bypass_gw="$(awg_route_line_to_gw "${route_line}" 2>/dev/null || true)"
+
+    if [[ -n "${bypass_if}" ]]; then
+      bypass_src="$(geo_detect_bypass_src "${bypass_if}" 2>/dev/null || true)"
+    fi
+
+    vpn_src="$(geo_detect_vpn_src "${vpn_if}" 2>/dev/null || true)"
+  fi
+
+  {
+    echo "RULESET_VERSION=${AWG_GEO_RULESET_VERSION}"
+
+    echo "VPN_IF=${vpn_if}"
+    echo "VPN_SRC=${vpn_src}"
+    echo "BYPASS_IF=${bypass_if}"
+    echo "BYPASS_GW=${bypass_gw}"
+    echo "BYPASS_SRC=${bypass_src}"
+
+    echo "RU_WHITELIST_CIDR=${AWG_RU_WHITELIST_CIDR}"
+    if [[ -f "${AWG_RU_WHITELIST_CIDR}" ]]; then
+      sha256sum "${AWG_RU_WHITELIST_CIDR}"
+    else
+      echo "missing"
+    fi
+
+    echo "CUSTOM_CIDR=${AWG_CUSTOM_CIDR}"
+    if [[ -f "${AWG_CUSTOM_CIDR}" ]]; then
+      sha256sum "${AWG_CUSTOM_CIDR}"
+    else
+      echo "missing"
+    fi
+  } | sha256sum | awk '{print $1}'
+}
+
+function geo_nft_table_exists() {
+  nft list table inet "${AWG_NFT_TABLE}" >/dev/null 2>&1
+}
+
+function geo_cache_is_actual() {
+  local current_hash
+  local saved_hash
+
+  [[ -f "${AWG_NFT_FILE}" ]] || return 1
+  [[ -f "${AWG_NFT_HASH_FILE}" ]] || return 1
+
+  current_hash="$(geo_sources_hash)"
+  saved_hash="$(cat "${AWG_NFT_HASH_FILE}" 2>/dev/null || true)"
+
+  [[ -n "${saved_hash}" ]] || return 1
+  [[ "${current_hash}" == "${saved_hash}" ]]
+}
+
+function geo_append_nft_elements() {
+  local file="$1"
+
+  [[ -f "${file}" ]] || return 0
+
+  grep -Ev '^\s*$|^\s*#' "${file}" \
+    | sed 's/\r$//' \
+    | while IFS= read -r line; do
+        line="$(echo "${line}" | awk '{print $1}')"
+
+        if awg_is_valid_cidr_or_ip "${line}"; then
+          echo "      ${line},"
+        else
+          awg_warn "Skip invalid CIDR/IP in ${file}: ${line}" >&2
+        fi
+      done \
+    | sort -V -u
+}
+
+function geo_generate_nft_file() {
+  [[ -f "${AWG_RU_WHITELIST_CIDR}" ]] || awg_die "CIDR file not found. Run: sudo awg-ui geo-update"
+
+  awg_prepare_dirs
+
+  if geo_cache_is_actual; then
+    awg_info "nftables file is actual. Skip generation."
+    return 0
+  fi
+
+  local current_hash
+  local vpn_if
+  local route_line
+  local bypass_if
+  local bypass_src
+  local vpn_src
+
+  vpn_if="$(awg_detect_vpn_if)"
+  route_line="$(awg_detect_bypass_route "${vpn_if}")"
+  bypass_if="$(awg_route_line_to_dev "${route_line}")"
+  bypass_src="$(geo_detect_bypass_src "${bypass_if}")"
+  vpn_src="$(geo_detect_vpn_src "${vpn_if}")"
+
+  current_hash="$(geo_sources_hash)"
+
+  awg_info "Generating nftables file..."
+  awg_info "NFT SNAT: mark ${AWG_FWMARK}, oif ${bypass_if}, ${vpn_src} -> ${bypass_src}"
+
+  {
+    cat <<EOF
+table inet ${AWG_NFT_TABLE} {
+  set ${AWG_NFT_SET_RU} {
+    type ipv4_addr
+    flags interval
+    auto-merge
+    elements = {
+EOF
+
+    geo_append_nft_elements "${AWG_RU_WHITELIST_CIDR}"
+
+    cat <<EOF
+    }
+  }
+
+  set ${AWG_NFT_SET_CUSTOM} {
+    type ipv4_addr
+    flags interval
+    auto-merge
+    elements = {
+EOF
+
+    geo_append_nft_elements "${AWG_CUSTOM_CIDR}"
+
+    cat <<EOF
+    }
+  }
+
+  chain mark_prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+
+    ip daddr @${AWG_NFT_SET_RU} meta mark set ${AWG_FWMARK}
+    ip daddr @${AWG_NFT_SET_CUSTOM} meta mark set ${AWG_FWMARK}
+  }
+
+  chain mark_output {
+    type route hook output priority mangle; policy accept;
+
+    ip daddr @${AWG_NFT_SET_RU} meta mark set ${AWG_FWMARK}
+    ip daddr @${AWG_NFT_SET_CUSTOM} meta mark set ${AWG_FWMARK}
+  }
+
+  chain snat_postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+
+    meta mark ${AWG_FWMARK} oifname "${bypass_if}" ip saddr ${vpn_src} snat to ${bypass_src}
+  }
+}
+EOF
+  } > "${AWG_NFT_FILE}"
+
+  chmod 600 "${AWG_NFT_FILE}"
+  echo "${current_hash}" > "${AWG_NFT_HASH_FILE}"
+  chmod 600 "${AWG_NFT_HASH_FILE}"
+}
+
+function geo_flush() {
+  awg_check_geo_commands
+
+  nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
+
+  while ip rule del pref 10066 2>/dev/null; do
+    :
+  done
+
+  while ip rule del pref "${AWG_ROUTE_RULE_PREF}" 2>/dev/null; do
+    :
+  done
+
+  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null; do
+    :
+  done
+
+  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null; do
+    :
+  done
+
+  ip route flush table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null || true
+  ip route flush table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null || true
+  ip route flush cache 2>/dev/null || true
+
+  rm -f "${AWG_NFT_HASH_FILE}"
+
+  awg_info "Geo bypass removed."
+}
+
+function geo_apply_policy_route() {
+  local vpn_if
+  local route_line
+  local bypass_if
+  local bypass_gw
+  local bypass_src
+
+  vpn_if="$(awg_detect_vpn_if)"
+  route_line="$(awg_detect_bypass_route "${vpn_if}")"
+  bypass_if="$(awg_route_line_to_dev "${route_line}")"
+  bypass_gw="$(awg_route_line_to_gw "${route_line}")"
+  bypass_src="$(geo_detect_bypass_src "${bypass_if}")"
+
+  [[ -n "${bypass_if}" ]] || awg_die "Cannot detect bypass interface"
+  [[ -n "${bypass_src}" ]] || awg_die "Cannot detect bypass source IP"
+
+  awg_info "VPN interface: ${vpn_if}"
+  awg_info "Bypass interface: ${bypass_if}"
+  awg_info "Bypass source IP: ${bypass_src}"
+
+  if [[ -n "${bypass_gw}" ]]; then
+    awg_info "Bypass gateway: ${bypass_gw}"
+  else
+    awg_warn "Bypass route has no gateway. Route will use dev only."
+  fi
+
+  awg_prepare_route_table_name
+
+  ip route flush table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null || true
+
+  if [[ -n "${bypass_gw}" ]]; then
+    ip route replace default via "${bypass_gw}" dev "${bypass_if}" src "${bypass_src}" table "${AWG_ROUTE_TABLE_NAME}"
+  else
+    ip route replace default dev "${bypass_if}" src "${bypass_src}" table "${AWG_ROUTE_TABLE_NAME}"
+  fi
+
+  while ip rule del pref 10066 2>/dev/null; do
+    :
+  done
+
+  while ip rule del pref "${AWG_ROUTE_RULE_PREF}" 2>/dev/null; do
+    :
+  done
+
+  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null; do
+    :
+  done
+
+  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null; do
+    :
+  done
+
+  ip rule add pref "${AWG_ROUTE_RULE_PREF}" fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}"
+
+  ip route flush cache 2>/dev/null || true
+}
+
+function geo_apply_nft() {
+  local need_reload="yes"
+
+  if geo_cache_is_actual && geo_nft_table_exists; then
+    need_reload="no"
+  fi
+
+  geo_generate_nft_file
+
+  if [[ "${need_reload}" == "no" ]]; then
+    awg_info "nftables table is actual. Skip nft reload."
+    return 0
+  fi
+
+  awg_info "Applying nftables rules..."
+
+  nft -c -f "${AWG_NFT_FILE}"
+  nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
+  nft -f "${AWG_NFT_FILE}"
+}
+
+function geo_apply() {
+  awg_prepare_dirs
+  awg_check_geo_commands
+  awg_prepare_forwarding
+  geo_apply_policy_route
+  geo_apply_nft
+
+  awg_info "Geo bypass applied."
+}
+
+function geo_status() {
+  echo "=== Files ==="
+
+  for file in "${AWG_GEOIP_RU_DAT}" "${AWG_GEOSITE_RU_DAT}" "${AWG_RU_WHITELIST_CIDR}" "${AWG_CUSTOM_CIDR}" "${AWG_NFT_FILE}" "${AWG_NFT_HASH_FILE}"; do
+    if [[ -f "${file}" ]]; then
+      ls -lh "${file}"
+    else
+      echo "missing: ${file}"
+    fi
+  done
+
+  echo
+  echo "=== CIDR counts ==="
+
+  if [[ -f "${AWG_RU_WHITELIST_CIDR}" ]]; then
+    echo "ru-whitelist: $(awk '!/^[[:space:]]*($|#)/ {count++} END {print count + 0}' "${AWG_RU_WHITELIST_CIDR}")"
+  fi
+
+  if [[ -f "${AWG_CUSTOM_CIDR}" ]]; then
+    echo "custom:       $(awk '!/^[[:space:]]*($|#)/ {count++} END {print count + 0}' "${AWG_CUSTOM_CIDR}")"
+  fi
+
+  echo
+  echo "=== Cache ==="
+
+  if geo_cache_is_actual; then
+    echo "nft cache: actual"
+  else
+    echo "nft cache: stale/missing"
+  fi
+
+  if geo_nft_table_exists; then
+    echo "nft table: exists"
+  else
+    echo "nft table: missing"
+  fi
+
+  echo
+  echo "=== ip rules ==="
+  ip rule show | grep -E "${AWG_FWMARK}|${AWG_ROUTE_TABLE_NAME}|${AWG_ROUTE_TABLE_ID}" || true
+
+  echo
+  echo "=== route table ${AWG_ROUTE_TABLE_NAME} ==="
+  ip route show table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null || true
+
+  echo
+  echo "=== route checks ==="
+  if [[ -f "${AWG_CUSTOM_CIDR}" ]] && [[ -s "${AWG_CUSTOM_CIDR}" ]]; then
+    local check_ip
+    check_ip="$(grep -Ev '^\s*$|^\s*#' "${AWG_CUSTOM_CIDR}" | head -n1 | awk '{print $1}' | cut -d/ -f1)"
+    if [[ -n "${check_ip}" ]]; then
+      ip route get "${check_ip}" mark "${AWG_FWMARK}" 2>/dev/null || true
+    fi
+  fi
+
+  echo
+  echo "=== nftables sets/rules ==="
+  if nft list table inet "${AWG_NFT_TABLE}" >/dev/null 2>&1; then
+    nft list table inet "${AWG_NFT_TABLE}" | grep -E "set ${AWG_NFT_SET_RU}|set ${AWG_NFT_SET_CUSTOM}|chain snat_postrouting|snat to|ip daddr @|meta mark set" || true
+  else
+    echo "nft table not found"
+  fi
+
+  echo
+  echo "=== forwarding ==="
+  sysctl net.ipv4.ip_forward 2>/dev/null || true
+  sysctl net.ipv4.conf.all.forwarding 2>/dev/null || true
+  sysctl net.ipv4.conf.default.forwarding 2>/dev/null || true
+
+  echo
+  echo "=== NAT / MTU ==="
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -E "MASQUERADE|${AWG_LAN_CIDR}" || true
+  iptables -t mangle -S FORWARD 2>/dev/null | grep TCPMSS || true
+}
+
+function show_custom() {
+  awg_prepare_dirs
+
+  echo "Custom bypass CIDR file:"
+  echo "  ${AWG_CUSTOM_CIDR}"
+  echo
+  echo "Content:"
+
+  if [[ -s "${AWG_CUSTOM_CIDR}" ]]; then
+    nl -ba "${AWG_CUSTOM_CIDR}"
+  else
+    echo "  empty"
+  fi
+}
+
+function apply_all() {
+  awg_prepare_forwarding
+  firewall_apply_runtime
+  ufw_sync
+
+  if [[ -f "${AWG_RU_WHITELIST_CIDR}" ]]; then
+    geo_apply
+  else
+    awg_warn "Geo CIDR file missing. Run: sudo awg-ui geo-sync"
+  fi
+}
+
+function restart_awg() {
+  local vpn_service
+
+  awg_check_system_commands
+
+  vpn_service="$(awg_detect_vpn_service)"
+
+  awg_info "Restarting ${vpn_service}..."
+
+  systemctl restart "${vpn_service}"
+
+  sleep 1
+
+  if systemctl is-active --quiet "${vpn_service}"; then
+    awg_info "${vpn_service} is active."
+  else
+    systemctl status "${vpn_service}" --no-pager || true
+    awg_die "${vpn_service} failed to start"
+  fi
+
+  apply_all
+}
+
+function status_all() {
+  local vpn_if=""
+  local vpn_service=""
+
+  echo "=== AmneziaWG service ==="
+  vpn_service="$(awg_detect_vpn_service 2>/dev/null || true)"
+
+  if [[ -n "${vpn_service}" ]]; then
+    systemctl status "${vpn_service}" --no-pager || true
+  else
+    awg_warn "AmneziaWG service not detected"
+  fi
+
+  echo
+  echo "=== Detected VPN interface ==="
+  vpn_if="$(awg_detect_vpn_if 2>/dev/null || true)"
+  echo "${vpn_if:-not detected}"
+
+  if [[ -n "${vpn_if}" ]]; then
+    echo
+    echo "=== Interface ${vpn_if} ==="
+    ip -br addr show "${vpn_if}" || true
+  fi
+
+  echo
+  echo "=== awg show ==="
+  if command -v awg >/dev/null 2>&1; then
+    awg show || true
+  else
+    awg_warn "awg command not found"
+  fi
+
+  echo
+  echo "=== Allowed IPs ==="
+  list_ips
+
+  echo
+  echo "=== UFW rules ${AWG_UFW_TAG} ==="
+  ufw status numbered | grep "${AWG_UFW_TAG}" || true
+
+  echo
+  geo_status
+}
+
+function restart_3proxy() {
+  awg_check_system_commands
+
+  awg_info "Restarting 3proxy.service..."
+  systemctl restart 3proxy.service
+  systemctl status 3proxy.service --no-pager || true
+}
+
+function edit_custom() {
+  awg_prepare_dirs
+
+  local editor="${EDITOR:-}"
+
+  if [[ -z "${editor}" ]]; then
+    if command -v nano >/dev/null 2>&1; then
+      editor="nano"
+    else
+      editor="vi"
+    fi
+  fi
+
+  "${editor}" "${AWG_CUSTOM_CIDR}"
+  chmod 600 "${AWG_CUSTOM_CIDR}"
+  geo_apply
+}
+
+function show_menu() {
+  local choice
+  local ip
+
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+awg-ui control menu
+===================
+  1. Status
+  2. Add allowed IP
+  3. Delete allowed IP
+  4. List allowed IPs
+  5. Apply firewall/NAT/geo rules
+  6. Restart AmneziaWG
+  7. Restart 3proxy
+  8. Geo sync
+  9. Geo status
+ 10. Show custom bypass CIDR
+ 11. Edit custom bypass CIDR
+ 12. Help
+  0. Exit
+
+EOF
+
+    read -rp "Choose an option: " choice
+
+    case "${choice}" in
+      1)
+        status_all
+        ;;
+      2)
+        read -rp "IP to add: " ip
+        add_ip "${ip}"
+        ;;
+      3)
+        read -rp "IP to delete: " ip
+        del_ip "${ip}"
+        ;;
+      4)
+        list_ips
+        ;;
+      5)
+        apply_all
+        ;;
+      6)
+        restart_awg
+        ;;
+      7)
+        restart_3proxy
+        ;;
+      8)
+        geo_update
+        geo_apply
+        ;;
+      9)
+        geo_status
+        ;;
+      10)
+        show_custom
+        ;;
+      11)
+        edit_custom
+        ;;
+      12)
+        usage
+        ;;
+      0|q|quit|exit)
+        return 0
+        ;;
+      *)
+        awg_warn "Unknown option: ${choice}"
+        ;;
+    esac
+
+    echo
+    read -rp "Press Enter to continue..." _
+  done
+}
+
+function main() {
+  awg_require_root "$@"
+
+  local command="${1:-menu}"
+
+  case "${command}" in
+    menu)
+      show_menu
+      ;;
+    add)
+      add_ip "${2:-}"
+      ;;
+    del|delete|remove)
+      del_ip "${2:-}"
+      ;;
+    list)
+      list_ips
+      ;;
+    sync|ufw-sync)
+      ufw_sync
+      ;;
+    geo-update)
+      geo_update
+      ;;
+    geo-apply)
+      geo_apply
+      ;;
+    geo-sync)
+      geo_update
+      geo_apply
+      ;;
+    geo-flush)
+      geo_flush
+      ;;
+    geo-status)
+      geo_status
+      ;;
+    custom)
+      show_custom
+      ;;
+    apply)
+      apply_all
+      ;;
+    restart)
+      restart_awg
+      ;;
+    restart-3proxy|proxy-restart)
+      restart_3proxy
+      ;;
+    status)
+      status_all
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      usage
+      awg_die "Unknown command: ${command}"
+      ;;
+  esac
+}
+
+main "$@"
