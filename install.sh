@@ -25,29 +25,12 @@ AWGUI_LOG="/var/log/awg-ui-install.log"
 AWGUI_DIR="/etc/amnezia"
 AWGUI_CONFIG_DIR="/etc/amnezia/amneziawg"
 AWGUI_DATA_DIR="/var/lib/awg-ui"
-AWGUI_CLIENT_DIR="/etc/amnezia/clients"
 AWGUI_ALLOW_FILE="/etc/amnezia/allowed-ips.txt"
 AWGUI_CUSTOM_CIDR="/etc/amnezia/custom-geo.cidr"
 AWGUI_ENV_FILE="/etc/default/awg-ui"
 
 AWGUI_VPN_IF="${AWGUI_VPN_IF:-awg0}"
 AWGUI_LISTEN_PORT="${AWGUI_LISTEN_PORT:-51820}"
-AWGUI_SERVER_ADDRESS="${AWGUI_SERVER_ADDRESS:-10.8.1.1/24}"
-AWGUI_CLIENT_NAME="${AWGUI_CLIENT_NAME:-client1}"
-AWGUI_CLIENT_ADDRESS="${AWGUI_CLIENT_ADDRESS:-10.8.1.2/32}"
-AWGUI_CLIENT_ALLOWED_IPS="${AWGUI_CLIENT_ALLOWED_IPS:-0.0.0.0/0}"
-AWGUI_CLIENT_DNS="${AWGUI_CLIENT_DNS:-1.1.1.1}"
-AWGUI_CLIENT_KEEPALIVE="${AWGUI_CLIENT_KEEPALIVE:-25}"
-AWGUI_ENDPOINT="${AWGUI_ENDPOINT:-}"
-AWGUI_AWG_JC="${AWGUI_AWG_JC:-4}"
-AWGUI_AWG_JMIN="${AWGUI_AWG_JMIN:-40}"
-AWGUI_AWG_JMAX="${AWGUI_AWG_JMAX:-70}"
-AWGUI_AWG_S1="${AWGUI_AWG_S1:-0}"
-AWGUI_AWG_S2="${AWGUI_AWG_S2:-0}"
-AWGUI_AWG_H1="${AWGUI_AWG_H1:-}"
-AWGUI_AWG_H2="${AWGUI_AWG_H2:-}"
-AWGUI_AWG_H3="${AWGUI_AWG_H3:-}"
-AWGUI_AWG_H4="${AWGUI_AWG_H4:-}"
 AWGUI_LAN_CIDR="${AWGUI_LAN_CIDR:-}"
 AWGUI_LAN_IF="${AWGUI_LAN_IF:-}"
 AWGUI_PROXY_BIND="${AWGUI_PROXY_BIND:-}"
@@ -60,11 +43,10 @@ AWGUI_ENABLE_UFW="${AWGUI_ENABLE_UFW:-1}"
 AWGUI_ENABLE_GEO="${AWGUI_ENABLE_GEO:-0}"
 AWGUI_FORCE_IPV4_APT="${AWGUI_FORCE_IPV4_APT:-0}"
 AWGUI_INSTALL_DEBUG_TOOLS="${AWGUI_INSTALL_DEBUG_TOOLS:-0}"
-AWGUI_REPO="${AWGUI_REPO:-}"
+AWGUI_REPO="${AWGUI_REPO:-dmigorg/awg-ui}"
 AWGUI_BRANCH="${AWGUI_BRANCH:-main}"
 AWGUI_SOURCE_BASE_URL="${AWGUI_SOURCE_BASE_URL:-}"
 AWGUI_3PROXY_VERSION="${AWGUI_3PROXY_VERSION:-0.9.5}"
-AWGUI_CLIENT_CONFIG=""
 
 if [[ "${AWGUI_NONINTERACTIVE:-0}" == "1" ]] || [[ ! -t 0 ]]; then
   NONINTERACTIVE=1
@@ -106,19 +88,18 @@ Local test:
   sudo bash install.sh
 
 GitHub install:
-  sudo bash <(curl -Ls https://raw.githubusercontent.com/<owner>/<repo>/<branch>/install.sh)
+  sudo bash <(curl -Ls https://raw.githubusercontent.com/dmigorg/awg-ui/main/install.sh)
 
 Environment:
   AWGUI_NONINTERACTIVE=1
-  AWGUI_REPO=owner/repo
+  AWGUI_REPO=dmigorg/awg-ui
   AWGUI_LAN_IF=eth0
   AWGUI_LAN_CIDR=192.168.1.0/24
   AWGUI_PROXY_BIND=192.168.1.10
-  AWGUI_ENDPOINT=vpn.example.com
   AWGUI_LISTEN_PORT=51820
-  AWGUI_SERVER_ADDRESS=10.8.1.1/24
-  AWGUI_CLIENT_NAME=client1
-  AWGUI_CLIENT_ADDRESS=10.8.1.2/32
+  AWGUI_CONFIG_FILE=/root/awg0.conf
+  AWGUI_CONFIG_URL=https://example.com/awg0.conf
+  AWGUI_CONFIG_TEXT='[Interface]...'
   AWGUI_HTTP_PORT=3128
   AWGUI_SOCKS_PORT=1080
   AWGUI_DNS_1=1.1.1.1
@@ -176,7 +157,9 @@ function init_log() {
 }
 
 function print_source_hint() {
-  if [[ -n "${AWGUI_SOURCE_BASE_URL}" ]]; then
+  if [[ -s "${SCRIPT_DIR}/awg-ui" ]]; then
+    info "Source mode: local repository directory"
+  elif [[ -n "${AWGUI_SOURCE_BASE_URL}" ]]; then
     info "Source base URL: ${AWGUI_SOURCE_BASE_URL}"
   elif [[ -n "${AWGUI_REPO}" ]]; then
     info "Source repo: ${AWGUI_REPO} (${AWGUI_BRANCH})"
@@ -297,21 +280,6 @@ function detect_lan_defaults() {
   fi
 }
 
-function detect_public_ip() {
-  curl -fsL --max-time 5 https://api64.ipify.org 2>/dev/null || true
-}
-
-function random_u32() {
-  od -An -N4 -tu4 /dev/urandom | awk '{print $1}'
-}
-
-function prepare_awg_parameters() {
-  AWGUI_AWG_H1="${AWGUI_AWG_H1:-$(random_u32)}"
-  AWGUI_AWG_H2="${AWGUI_AWG_H2:-$(random_u32)}"
-  AWGUI_AWG_H3="${AWGUI_AWG_H3:-$(random_u32)}"
-  AWGUI_AWG_H4="${AWGUI_AWG_H4:-$(random_u32)}"
-}
-
 function backup_file() {
   local file="$1"
   local backup_dir
@@ -408,7 +376,6 @@ function prepare_dirs() {
   install -d -m 700 "${AWGUI_DIR}"
   install -d -m 700 "${AWGUI_CONFIG_DIR}"
   install -d -m 700 "${AWGUI_DATA_DIR}"
-  install -d -m 700 "${AWGUI_CLIENT_DIR}"
   install -d -m 755 "${AWGUI_APP_DIR}"
   install -d -m 755 /usr/bin
 
@@ -823,6 +790,14 @@ function import_existing_config_dir() {
   fi
 }
 
+function validate_awg_config_file() {
+  local config="$1"
+
+  [[ -s "${config}" ]] || die "AWG config is empty: ${config}"
+  grep -Eq '^[[:space:]]*\[Interface\][[:space:]]*$' "${config}" || die "AWG config must contain [Interface]: ${config}"
+  grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${config}" || die "AWG config must contain Interface PrivateKey: ${config}"
+}
+
 function install_config_from_env() {
   if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
     return 0
@@ -831,120 +806,85 @@ function install_config_from_env() {
   if [[ -n "${AWGUI_CONFIG_FILE:-}" ]]; then
     [[ -s "${AWGUI_CONFIG_FILE}" ]] || die "AWGUI_CONFIG_FILE does not exist: ${AWGUI_CONFIG_FILE}"
     install -m 600 -o root -g root "${AWGUI_CONFIG_FILE}" "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
     return 0
   fi
 
   if [[ -n "${AWGUI_CONFIG_URL:-}" ]]; then
     curl -fL --retry 5 -o "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf" "${AWGUI_CONFIG_URL}"
     chmod 600 "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
     return 0
   fi
 
-  info "No AmneziaWG config found. A new server/client config will be generated."
-}
-
-function prompt_awg_config_values_if_needed() {
-  if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
+  if [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
+    printf '%s\n' "${AWGUI_CONFIG_TEXT}" > "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    chmod 600 "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
     return 0
   fi
-
-  if [[ -z "${AWGUI_ENDPOINT}" ]]; then
-    AWGUI_ENDPOINT="$(detect_public_ip)"
-  fi
-
-  prompt_or_default AWGUI_ENDPOINT "Public endpoint DNS/IP [${AWGUI_ENDPOINT:-required}]: " "${AWGUI_ENDPOINT}" AWGUI_ENDPOINT
-  [[ -n "${AWGUI_ENDPOINT}" ]] || die "Public endpoint is required. Set AWGUI_ENDPOINT."
-  prompt_or_default AWGUI_LISTEN_PORT "AmneziaWG UDP port [${AWGUI_LISTEN_PORT}]: " "${AWGUI_LISTEN_PORT}" AWGUI_LISTEN_PORT
-  prompt_or_default AWGUI_SERVER_ADDRESS "Server tunnel address [${AWGUI_SERVER_ADDRESS}]: " "${AWGUI_SERVER_ADDRESS}" AWGUI_SERVER_ADDRESS
-  prompt_or_default AWGUI_CLIENT_NAME "First client name [${AWGUI_CLIENT_NAME}]: " "${AWGUI_CLIENT_NAME}" AWGUI_CLIENT_NAME
-  prompt_or_default AWGUI_CLIENT_ADDRESS "First client tunnel address [${AWGUI_CLIENT_ADDRESS}]: " "${AWGUI_CLIENT_ADDRESS}" AWGUI_CLIENT_ADDRESS
-
-  [[ "${AWGUI_LISTEN_PORT}" =~ ^[0-9]+$ ]] || die "Invalid AWGUI_LISTEN_PORT: ${AWGUI_LISTEN_PORT}"
-  (( AWGUI_LISTEN_PORT >= 1 && AWGUI_LISTEN_PORT <= 65535 )) || die "Invalid AWGUI_LISTEN_PORT: ${AWGUI_LISTEN_PORT}"
-  [[ "${AWGUI_CLIENT_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid AWGUI_CLIENT_NAME: ${AWGUI_CLIENT_NAME}"
-  is_cidr_or_ip "${AWGUI_SERVER_ADDRESS}" || die "Invalid AWGUI_SERVER_ADDRESS: ${AWGUI_SERVER_ADDRESS}"
-  is_cidr_or_ip "${AWGUI_CLIENT_ADDRESS}" || die "Invalid AWGUI_CLIENT_ADDRESS: ${AWGUI_CLIENT_ADDRESS}"
 }
 
-function create_awg_config_if_missing() {
+function paste_awg_config_if_missing() {
   local server_config="${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
-  local client_config="${AWGUI_CLIENT_DIR}/${AWGUI_CLIENT_NAME}.conf"
-  local server_private server_public client_private client_public preshared_key endpoint_value
+  local tmp line
 
   if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
     info "Existing AmneziaWG config found. Keeping it."
     return 0
   fi
 
-  command_exists awg || die "awg command is required to generate keys"
+  [[ "${NONINTERACTIVE}" != "1" ]] || die "No AWG config found. Set AWGUI_CONFIG_FILE, AWGUI_CONFIG_URL, or AWGUI_CONFIG_TEXT."
 
-  [[ -n "${AWGUI_ENDPOINT}" ]] || AWGUI_ENDPOINT="$(detect_public_ip)"
-  [[ -n "${AWGUI_ENDPOINT}" ]] || die "Cannot detect public endpoint. Set AWGUI_ENDPOINT."
+  info "Paste AmneziaWG config for ${AWGUI_VPN_IF}. Finish with a line containing only EOF."
+  tmp="$(mktemp)"
 
-  prepare_awg_parameters
+  while IFS= read -r line; do
+    [[ "${line}" == "EOF" ]] && break
+    printf '%s\n' "${line}" >> "${tmp}"
+  done
 
-  info "Generating AmneziaWG keys and initial configs..."
+  [[ -s "${tmp}" ]] || {
+    rm -f "${tmp}"
+    die "Pasted AWG config is empty"
+  }
 
-  server_private="$(awg genkey)"
-  server_public="$(printf '%s\n' "${server_private}" | awg pubkey)"
-  client_private="$(awg genkey)"
-  client_public="$(printf '%s\n' "${client_private}" | awg pubkey)"
-  preshared_key="$(awg genpsk)"
-  endpoint_value="${AWGUI_ENDPOINT}:${AWGUI_LISTEN_PORT}"
+  grep -Eq '^[[:space:]]*\[Interface\][[:space:]]*$' "${tmp}" || {
+    rm -f "${tmp}"
+    die "Pasted AWG config must contain [Interface]"
+  }
+
+  grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${tmp}" || {
+    rm -f "${tmp}"
+    die "Pasted AWG config must contain Interface PrivateKey"
+  }
 
   backup_file "${server_config}"
-  cat > "${server_config}" <<EOF
-[Interface]
-PrivateKey = ${server_private}
-Address = ${AWGUI_SERVER_ADDRESS}
-ListenPort = ${AWGUI_LISTEN_PORT}
-Jc = ${AWGUI_AWG_JC}
-Jmin = ${AWGUI_AWG_JMIN}
-Jmax = ${AWGUI_AWG_JMAX}
-S1 = ${AWGUI_AWG_S1}
-S2 = ${AWGUI_AWG_S2}
-H1 = ${AWGUI_AWG_H1}
-H2 = ${AWGUI_AWG_H2}
-H3 = ${AWGUI_AWG_H3}
-H4 = ${AWGUI_AWG_H4}
-PostUp = ${AWGUI_CLI} apply
-PreDown = ${AWGUI_CLI} geo-flush
+  install -m 600 -o root -g root "${tmp}" "${server_config}"
+  rm -f "${tmp}"
 
-[Peer]
-PublicKey = ${client_public}
-PresharedKey = ${preshared_key}
-AllowedIPs = ${AWGUI_CLIENT_ADDRESS}
-EOF
-  chmod 600 "${server_config}"
+  info "Saved AWG config: ${server_config}"
+}
 
-  backup_file "${client_config}"
-  cat > "${client_config}" <<EOF
-[Interface]
-PrivateKey = ${client_private}
-Address = ${AWGUI_CLIENT_ADDRESS}
-DNS = ${AWGUI_CLIENT_DNS}
-Jc = ${AWGUI_AWG_JC}
-Jmin = ${AWGUI_AWG_JMIN}
-Jmax = ${AWGUI_AWG_JMAX}
-S1 = ${AWGUI_AWG_S1}
-S2 = ${AWGUI_AWG_S2}
-H1 = ${AWGUI_AWG_H1}
-H2 = ${AWGUI_AWG_H2}
-H3 = ${AWGUI_AWG_H3}
-H4 = ${AWGUI_AWG_H4}
+function detect_listen_port_from_config() {
+  local config="${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+  local detected=""
 
-[Peer]
-PublicKey = ${server_public}
-PresharedKey = ${preshared_key}
-Endpoint = ${endpoint_value}
-AllowedIPs = ${AWGUI_CLIENT_ALLOWED_IPS}
-PersistentKeepalive = ${AWGUI_CLIENT_KEEPALIVE}
-EOF
-  chmod 600 "${client_config}"
+  [[ -f "${config}" ]] || return 0
 
-  AWGUI_CLIENT_CONFIG="${client_config}"
-  info "Created server config: ${server_config}"
-  info "Created client config: ${client_config}"
+  detected="$(awk -F= '
+    $1 ~ /^[[:space:]]*ListenPort[[:space:]]*$/ {
+      gsub(/[[:space:]]/, "", $2)
+      print $2
+      exit
+    }
+  ' "${config}")"
+
+  if [[ -n "${detected}" ]]; then
+    [[ "${detected}" =~ ^[0-9]+$ ]] || die "Invalid ListenPort in ${config}: ${detected}"
+    (( detected >= 1 && detected <= 65535 )) || die "Invalid ListenPort in ${config}: ${detected}"
+    AWGUI_LISTEN_PORT="${detected}"
+  fi
 }
 
 function detect_vpn_if() {
@@ -981,7 +921,7 @@ function prepare_config_hooks() {
   if ! grep -Fxq "PostUp = ${AWGUI_CLI} apply" "${config}"; then
     tmp="$(mktemp)"
     awk -v hook="PostUp = /usr/bin/awg-ui apply" '
-      /^\[Interface\]$/ && !done { print; print hook; done=1; next }
+      /^[[:space:]]*\[Interface\][[:space:]]*$/ && !done { print; print hook; done=1; next }
       { print }
     ' "${config}" > "${tmp}"
     install -m 600 -o root -g root "${tmp}" "${config}"
@@ -991,7 +931,7 @@ function prepare_config_hooks() {
   if ! grep -Fxq "PreDown = ${AWGUI_CLI} geo-flush" "${config}"; then
     tmp="$(mktemp)"
     awk -v hook="PreDown = /usr/bin/awg-ui geo-flush" '
-      /^\[Interface\]$/ && !done { print; print hook; done=1; next }
+      /^[[:space:]]*\[Interface\][[:space:]]*$/ && !done { print; print hook; done=1; next }
       { print }
     ' "${config}" > "${tmp}"
     install -m 600 -o root -g root "${tmp}" "${config}"
@@ -1145,11 +1085,22 @@ function enable_services() {
 
   systemctl daemon-reload
   systemctl enable --now nftables
+  systemctl is-active --quiet nftables || die "nftables service is not active"
 
   if [[ -f "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf" ]]; then
-    systemctl enable --now "awg-quick@${AWGUI_VPN_IF}.service"
+    systemctl enable "awg-quick@${AWGUI_VPN_IF}.service"
+    if ! systemctl restart "awg-quick@${AWGUI_VPN_IF}.service"; then
+      systemctl status "awg-quick@${AWGUI_VPN_IF}.service" --no-pager || true
+      die "Failed to start awg-quick@${AWGUI_VPN_IF}.service"
+    fi
+    systemctl is-active --quiet "awg-quick@${AWGUI_VPN_IF}.service" || die "awg-quick@${AWGUI_VPN_IF}.service is not active"
     if [[ "${AWGUI_ENABLE_3PROXY}" == "1" ]]; then
-      systemctl enable --now 3proxy.service
+      systemctl enable 3proxy.service
+      if ! systemctl restart 3proxy.service; then
+        systemctl status 3proxy.service --no-pager || true
+        die "Failed to start 3proxy.service"
+      fi
+      systemctl is-active --quiet 3proxy.service || die "3proxy.service is not active"
     fi
   else
     warn "Skipping awg-quick start because ${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf is missing."
@@ -1188,9 +1139,6 @@ function print_summary() {
   else
     echo "  3proxy:      disabled"
   fi
-  if [[ -n "${AWGUI_CLIENT_CONFIG}" ]]; then
-    echo "  Client conf: ${AWGUI_CLIENT_CONFIG}"
-  fi
   echo "  Log file:    ${AWGUI_LOG}"
   echo "======================================================="
 }
@@ -1228,9 +1176,9 @@ function main() {
   install_awg_ui_files
   import_existing_config_dir
   install_config_from_env
-  prompt_awg_config_values_if_needed
-  create_awg_config_if_missing
+  paste_awg_config_if_missing
   detect_vpn_if
+  detect_listen_port_from_config
   detect_lan_values
   write_env_file
   prepare_config_hooks
