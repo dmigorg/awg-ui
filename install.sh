@@ -47,6 +47,8 @@ AWGUI_REPO="${AWGUI_REPO:-dmigorg/awg-ui}"
 AWGUI_BRANCH="${AWGUI_BRANCH:-main}"
 AWGUI_SOURCE_BASE_URL="${AWGUI_SOURCE_BASE_URL:-}"
 AWGUI_3PROXY_VERSION="${AWGUI_3PROXY_VERSION:-0.9.5}"
+AWGUI_KEEP_EXISTING_CONFIG=0
+AWGUI_PASTE_CONFIG=0
 
 AWGUI_INPUT_DEVICE="/dev/stdin"
 if [[ -t 2 ]] && [[ -r /dev/tty ]]; then
@@ -814,11 +816,20 @@ function validate_awg_config_file() {
 
 function choose_awg_config_source() {
   local choice=""
+  local has_existing=0
 
-  if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null ||
-     [[ -n "${AWGUI_CONFIG_FILE:-}" ]] ||
+  if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
+    has_existing=1
+  fi
+
+  if [[ -n "${AWGUI_CONFIG_FILE:-}" ]] ||
      [[ -n "${AWGUI_CONFIG_URL:-}" ]] ||
      [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
+    return 0
+  fi
+
+  if [[ "${has_existing}" == "1" ]] && [[ "${NONINTERACTIVE}" == "1" ]]; then
+    AWGUI_KEEP_EXISTING_CONFIG=1
     return 0
   fi
 
@@ -827,12 +838,37 @@ function choose_awg_config_source() {
 
   while true; do
     echo
-    echo "No AmneziaWG configuration was found. Choose its source:"
-    echo "  1. Local configuration file"
-    echo "  2. Download from URL"
-    echo "  3. Paste configuration manually"
-    echo "  0. Cancel installation"
-    read_user_input choice "Choose an option [1-3, 0]: "
+    if [[ "${has_existing}" == "1" ]]; then
+      echo "An existing AmneziaWG configuration was found:"
+      find "${AWGUI_CONFIG_DIR}" -maxdepth 1 -type f -name '*.conf' -print | sort | sed 's/^/  /'
+      echo
+      echo "Choose what to do with the configuration:"
+      echo "  1. Keep the existing configuration"
+      echo "  2. Replace it with a local configuration file"
+      echo "  3. Replace it with a configuration downloaded from URL"
+      echo "  4. Replace it by pasting a configuration manually"
+      echo "  0. Cancel installation"
+      read_user_input choice "Choose an option [1-4, 0]: "
+    else
+      echo "No AmneziaWG configuration was found. Choose its source:"
+      echo "  1. Local configuration file"
+      echo "  2. Download from URL"
+      echo "  3. Paste configuration manually"
+      echo "  0. Cancel installation"
+      read_user_input choice "Choose an option [1-3, 0]: "
+    fi
+
+    if [[ "${has_existing}" == "1" ]]; then
+      case "${choice}" in
+        1)
+          AWGUI_KEEP_EXISTING_CONFIG=1
+          return 0
+          ;;
+        2) choice=1 ;;
+        3) choice=2 ;;
+        4) choice=3 ;;
+      esac
+    fi
 
     case "${choice}" in
       1)
@@ -853,6 +889,7 @@ function choose_awg_config_source() {
         return 0
         ;;
       3)
+        AWGUI_PASTE_CONFIG=1
         return 0
         ;;
       0)
@@ -865,30 +902,54 @@ function choose_awg_config_source() {
   done
 }
 
+function install_validated_config() {
+  local source_config="$1"
+  local server_config="${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+
+  validate_awg_config_file "${source_config}"
+
+  if [[ "$(readlink -f "${source_config}")" == "$(readlink -f "${server_config}")" ]]; then
+    chmod 600 "${server_config}"
+    info "Using AWG config: ${server_config}"
+    return 0
+  fi
+
+  backup_file "${server_config}"
+  install -m 600 -o root -g root "${source_config}" "${server_config}"
+  info "Installed AWG config: ${server_config}"
+}
+
 function install_config_from_env() {
-  if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
+  local tmp
+
+  if [[ "${AWGUI_KEEP_EXISTING_CONFIG}" == "1" ]]; then
+    info "Keeping the existing AmneziaWG configuration."
     return 0
   fi
 
   if [[ -n "${AWGUI_CONFIG_FILE:-}" ]]; then
     [[ -s "${AWGUI_CONFIG_FILE}" ]] || die "AWGUI_CONFIG_FILE does not exist: ${AWGUI_CONFIG_FILE}"
-    install -m 600 -o root -g root "${AWGUI_CONFIG_FILE}" "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
-    validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    install_validated_config "${AWGUI_CONFIG_FILE}"
     return 0
   fi
 
   if [[ -n "${AWGUI_CONFIG_URL:-}" ]]; then
     command_exists curl || die "curl is required to download AWGUI_CONFIG_URL: ${AWGUI_CONFIG_URL}"
-    curl -fL --retry 5 -o "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf" "${AWGUI_CONFIG_URL}"
-    chmod 600 "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
-    validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    tmp="$(mktemp)"
+    if ! curl -fL --retry 5 -o "${tmp}" "${AWGUI_CONFIG_URL}"; then
+      rm -f "${tmp}"
+      die "Cannot download AWG config from URL: ${AWGUI_CONFIG_URL}"
+    fi
+    install_validated_config "${tmp}"
+    rm -f "${tmp}"
     return 0
   fi
 
   if [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
-    printf '%s\n' "${AWGUI_CONFIG_TEXT}" > "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
-    chmod 600 "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
-    validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+    tmp="$(mktemp)"
+    printf '%s\n' "${AWGUI_CONFIG_TEXT}" > "${tmp}"
+    install_validated_config "${tmp}"
+    rm -f "${tmp}"
     return 0
   fi
 }
@@ -897,8 +958,12 @@ function paste_awg_config_if_missing() {
   local server_config="${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
   local tmp line
 
-  if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
-    info "Existing AmneziaWG config found. Keeping it."
+  if [[ "${AWGUI_KEEP_EXISTING_CONFIG}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ "${AWGUI_PASTE_CONFIG}" != "1" ]] &&
+     compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
     return 0
   fi
 
@@ -1229,10 +1294,10 @@ function main() {
   info "Checking AmneziaWG configuration..."
   prepare_dirs
   import_existing_config_dir
+  detect_vpn_if
   choose_awg_config_source
   install_config_from_env
   paste_awg_config_if_missing
-  detect_vpn_if
   validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
   detect_listen_port_from_config
 
