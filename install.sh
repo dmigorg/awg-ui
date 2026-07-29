@@ -812,6 +812,7 @@ function install_config_from_env() {
   fi
 
   if [[ -n "${AWGUI_CONFIG_URL:-}" ]]; then
+    command_exists curl || die "curl is required to download AWGUI_CONFIG_URL: ${AWGUI_CONFIG_URL}"
     curl -fL --retry 5 -o "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf" "${AWGUI_CONFIG_URL}"
     chmod 600 "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
     validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
@@ -1158,6 +1159,16 @@ function main() {
   info "Log file: ${AWGUI_LOG}"
   print_source_hint
   detect_os
+
+  info "Checking AmneziaWG configuration..."
+  prepare_dirs
+  import_existing_config_dir
+  install_config_from_env
+  paste_awg_config_if_missing
+  detect_vpn_if
+  validate_awg_config_file "${AWGUI_CONFIG_DIR}/${AWGUI_VPN_IF}.conf"
+  detect_listen_port_from_config
+
   detect_lan_defaults
 
   prompt_or_default AWGUI_LAN_CIDR "LAN CIDR allowed to use proxy/VPN [${AWGUI_LAN_CIDR:-auto-detect}]: " "${AWGUI_LAN_CIDR}" AWGUI_LAN_CIDR
@@ -1173,13 +1184,7 @@ function main() {
   if [[ "${AWGUI_ENABLE_3PROXY}" == "1" ]]; then
     install_3proxy
   fi
-  prepare_dirs
   install_awg_ui_files
-  import_existing_config_dir
-  install_config_from_env
-  paste_awg_config_if_missing
-  detect_vpn_if
-  detect_listen_port_from_config
   detect_lan_values
   write_env_file
   prepare_config_hooks
