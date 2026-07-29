@@ -48,7 +48,13 @@ AWGUI_BRANCH="${AWGUI_BRANCH:-main}"
 AWGUI_SOURCE_BASE_URL="${AWGUI_SOURCE_BASE_URL:-}"
 AWGUI_3PROXY_VERSION="${AWGUI_3PROXY_VERSION:-0.9.5}"
 
-if [[ "${AWGUI_NONINTERACTIVE:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+AWGUI_INPUT_DEVICE="/dev/stdin"
+if [[ -t 2 ]] && [[ -r /dev/tty ]]; then
+  AWGUI_INPUT_DEVICE="/dev/tty"
+fi
+
+if [[ "${AWGUI_NONINTERACTIVE:-0}" == "1" ]] ||
+   { [[ "${AWGUI_INPUT_DEVICE}" != "/dev/tty" ]] && [[ ! -t 0 ]]; }; then
   NONINTERACTIVE=1
 else
   NONINTERACTIVE=0
@@ -114,14 +120,21 @@ function command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+function read_user_input() {
+  local __var="$1" __prompt="$2" __input
+
+  IFS= read -r -p "${__prompt}" __input < "${AWGUI_INPUT_DEVICE}" ||
+    die "Unable to read input from ${AWGUI_INPUT_DEVICE}"
+  printf -v "${__var}" '%s' "${__input}"
+}
+
 function prompt_or_default() {
   local __var="$1" __prompt="$2" __default="$3" __env="${4:-$1}"
 
   if [[ "${NONINTERACTIVE}" == "1" ]]; then
     printf -v "${__var}" '%s' "${!__env:-${__default}}"
   else
-    # shellcheck disable=SC2229
-    read -rp "${__prompt}" "${__var}"
+    read_user_input "${__var}" "${__prompt}"
     if [[ -z "${!__var}" ]]; then
       printf -v "${__var}" '%s' "${__default}"
     fi
@@ -135,7 +148,7 @@ function prompt_yes_no() {
   if [[ "${NONINTERACTIVE}" == "1" ]]; then
     answer="${!__env:-${__default}}"
   else
-    read -rp "${__prompt}" answer
+    read_user_input answer "${__prompt}"
     answer="${answer:-${__default}}"
   fi
 
@@ -799,6 +812,59 @@ function validate_awg_config_file() {
   grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${config}" || die "AWG config must contain Interface PrivateKey: ${config}"
 }
 
+function choose_awg_config_source() {
+  local choice=""
+
+  if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null ||
+     [[ -n "${AWGUI_CONFIG_FILE:-}" ]] ||
+     [[ -n "${AWGUI_CONFIG_URL:-}" ]] ||
+     [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
+    return 0
+  fi
+
+  [[ "${NONINTERACTIVE}" != "1" ]] ||
+    die "No AWG config found. Set AWGUI_CONFIG_FILE, AWGUI_CONFIG_URL, or AWGUI_CONFIG_TEXT."
+
+  while true; do
+    echo
+    echo "No AmneziaWG configuration was found. Choose its source:"
+    echo "  1. Local configuration file"
+    echo "  2. Download from URL"
+    echo "  3. Paste configuration manually"
+    echo "  0. Cancel installation"
+    read_user_input choice "Choose an option [1-3, 0]: "
+
+    case "${choice}" in
+      1)
+        read_user_input AWGUI_CONFIG_FILE "Enter the full path to the config file: "
+        if [[ ! -s "${AWGUI_CONFIG_FILE}" ]]; then
+          warn "Config file does not exist or is empty: ${AWGUI_CONFIG_FILE:-<empty>}"
+          AWGUI_CONFIG_FILE=""
+          continue
+        fi
+        return 0
+        ;;
+      2)
+        read_user_input AWGUI_CONFIG_URL "Enter the config URL: "
+        if [[ -z "${AWGUI_CONFIG_URL}" ]]; then
+          warn "Config URL cannot be empty."
+          continue
+        fi
+        return 0
+        ;;
+      3)
+        return 0
+        ;;
+      0)
+        die "Installation cancelled."
+        ;;
+      *)
+        warn "Invalid option: ${choice:-<empty>}"
+        ;;
+    esac
+  done
+}
+
 function install_config_from_env() {
   if compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
     return 0
@@ -844,7 +910,7 @@ function paste_awg_config_if_missing() {
   while IFS= read -r line; do
     [[ "${line}" == "EOF" ]] && break
     printf '%s\n' "${line}" >> "${tmp}"
-  done
+  done < "${AWGUI_INPUT_DEVICE}"
 
   [[ -s "${tmp}" ]] || {
     rm -f "${tmp}"
@@ -1163,6 +1229,7 @@ function main() {
   info "Checking AmneziaWG configuration..."
   prepare_dirs
   import_existing_config_dir
+  choose_awg_config_source
   install_config_from_env
   paste_awg_config_if_missing
   detect_vpn_if
