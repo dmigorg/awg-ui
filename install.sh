@@ -19,6 +19,8 @@ plain='\033[0m'
 
 AWGUI_APP_DIR="/usr/local/awg-ui"
 AWGUI_COMMON="${AWGUI_APP_DIR}/awg-common.sh"
+AWGUI_INSTALLER="${AWGUI_APP_DIR}/install.sh"
+AWGUI_CLI_SOURCE="${AWGUI_APP_DIR}/awg-ui"
 AWGUI_CLI="/usr/bin/awg-ui"
 AWGUI_LOG="/var/log/awg-ui-install.log"
 
@@ -120,6 +122,12 @@ EOF
 
 function command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+function is_3proxy_installed() {
+  command_exists 3proxy &&
+    command_exists systemctl &&
+    systemctl cat 3proxy.service >/dev/null 2>&1
 }
 
 function read_user_input() {
@@ -446,6 +454,7 @@ readonly AWG_CONFIG_DIR="/etc/amnezia/amneziawg"
 readonly AWG_ALLOW_FILE="/etc/amnezia/allowed-ips.txt"
 readonly AWG_CUSTOM_CIDR="/etc/amnezia/custom-geo.cidr"
 readonly AWG_ENV_FILE="/etc/default/awg-ui"
+readonly AWG_INSTALLER="/usr/local/awg-ui/install.sh"
 
 if [[ -f "${AWG_ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -781,24 +790,38 @@ AWG_COMMON_EOF
 
 function install_awg_ui_files() {
   local cli_temp="/usr/bin/awg-ui-temp.$$"
+  local installer_temp="${AWGUI_APP_DIR}/install.sh.tmp.$$"
   rm -f "${cli_temp}"
+  rm -f "${installer_temp}"
 
   fetch_source_file "awg-ui" "${cli_temp}"
+  fetch_source_file "install.sh" "${installer_temp}"
 
   if [[ ! -s "${cli_temp}" ]]; then
     rm -f "${cli_temp}"
     die "Downloaded awg-ui is empty"
   fi
 
+  if [[ ! -s "${installer_temp}" ]]; then
+    rm -f "${cli_temp}" "${installer_temp}"
+    die "Downloaded install.sh is empty"
+  fi
+
   bash -n "${cli_temp}"
+  bash -n "${installer_temp}"
 
   backup_file "${AWGUI_CLI}"
+  backup_file "${AWGUI_CLI_SOURCE}"
+  backup_file "${AWGUI_INSTALLER}"
 
   mv -f "${cli_temp}" "${AWGUI_CLI}"
+  install -m 700 -o root -g root "${AWGUI_CLI}" "${AWGUI_CLI_SOURCE}"
+  mv -f "${installer_temp}" "${AWGUI_INSTALLER}"
   chmod 700 "${AWGUI_CLI}"
+  chmod 700 "${AWGUI_INSTALLER}"
   write_awg_common_file
 
-  info "Installed ${AWGUI_CLI} and ${AWGUI_COMMON}."
+  info "Installed ${AWGUI_CLI}, ${AWGUI_INSTALLER}, and ${AWGUI_COMMON}."
 }
 
 function import_existing_config_dir() {
@@ -1271,7 +1294,15 @@ function print_summary() {
   echo -e "  ${blue}awg-ui add <ip>${plain}     Add LAN client"
   echo -e "  ${blue}awg-ui del <ip>${plain}     Remove LAN client"
   echo -e "  ${blue}awg-ui restart${plain}      Restart AmneziaWG and rules"
+  if is_3proxy_installed; then
+    echo -e "  ${blue}awg-ui stop${plain}         Stop AmneziaWG and 3proxy"
+    echo -e "  ${blue}awg-ui restart-3proxy${plain} Restart 3proxy"
+  else
+    echo -e "  ${blue}awg-ui stop${plain}         Stop AmneziaWG"
+    echo -e "  ${blue}awg-ui install-3proxy${plain} Install and configure 3proxy"
+  fi
   echo -e "  ${blue}awg-ui geo-sync${plain}     Update and apply geo bypass"
+  echo -e "  ${blue}awg-ui geo-flush${plain}    Remove geo bypass rules"
   echo
   if [[ "${AWGUI_ENABLE_3PROXY}" == "1" ]]; then
     echo "  HTTP proxy:  ${AWGUI_PROXY_BIND}:${AWGUI_HTTP_PORT}"

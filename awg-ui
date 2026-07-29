@@ -6,6 +6,12 @@ source /usr/local/awg-ui/awg-common.sh
 
 readonly AWG_GEO_RULESET_VERSION="2026-07-29-empty-sets-v2"
 
+function is_3proxy_installed() {
+  command -v 3proxy >/dev/null 2>&1 &&
+    command -v systemctl >/dev/null 2>&1 &&
+    systemctl cat 3proxy.service >/dev/null 2>&1
+}
+
 function usage() {
   cat <<EOF
 Usage:
@@ -16,8 +22,23 @@ Usage:
   awg-ui sync               Sync UFW route rules from allow list
   awg-ui apply              Apply NAT/MSS + UFW rules + geo bypass
   awg-ui restart            Restart AmneziaWG and apply all rules
+  awg-ui stop               Stop managed services
+  awg-ui stop-awg           Stop AmneziaWG
   awg-ui status             Show full status
+EOF
 
+  if is_3proxy_installed; then
+    cat <<EOF
+  awg-ui restart-3proxy     Restart 3proxy
+  awg-ui stop-3proxy        Stop 3proxy
+EOF
+  else
+    cat <<EOF
+  awg-ui install-3proxy     Install and configure 3proxy
+EOF
+  fi
+
+  cat <<EOF
   awg-ui geo-update         Download RU geo files and ru-whitelist CIDR list
   awg-ui geo-apply          Apply nftables fwmark bypass
   awg-ui geo-sync           geo-update + geo-apply
@@ -718,9 +739,76 @@ function status_all() {
 function restart_3proxy() {
   awg_check_system_commands
 
+  is_3proxy_installed ||
+    awg_die "3proxy is not installed. Run: sudo awg-ui install-3proxy"
+
   awg_info "Restarting 3proxy.service..."
   systemctl restart 3proxy.service
   systemctl status 3proxy.service --no-pager || true
+}
+
+function install_3proxy_service() {
+  local installer="${AWG_INSTALLER:-/usr/local/awg-ui/install.sh}"
+
+  if is_3proxy_installed; then
+    awg_info "3proxy is already installed."
+    return 0
+  fi
+
+  [[ -s "${installer}" ]] ||
+    awg_die "Installer not found: ${installer}. Run the awg-ui installer again."
+
+  awg_info "Installing and configuring 3proxy..."
+  env \
+    AWGUI_NONINTERACTIVE=1 \
+    AWGUI_ENABLE_3PROXY=1 \
+    AWGUI_LAN_IF="${AWG_LAN_IF:-}" \
+    AWGUI_LAN_CIDR="${AWG_LAN_CIDR:-}" \
+    bash "${installer}"
+
+  is_3proxy_installed || awg_die "3proxy installation did not complete successfully"
+  awg_info "3proxy installed and configured."
+}
+
+function stop_awg() {
+  local vpn_service
+
+  awg_check_system_commands
+
+  vpn_service="$(awg_detect_vpn_service)"
+  awg_info "Stopping ${vpn_service}..."
+  systemctl stop "${vpn_service}"
+
+  if systemctl is-active --quiet "${vpn_service}"; then
+    systemctl status "${vpn_service}" --no-pager || true
+    awg_die "${vpn_service} is still active"
+  fi
+
+  awg_info "${vpn_service} stopped."
+}
+
+function stop_3proxy() {
+  awg_check_system_commands
+
+  is_3proxy_installed ||
+    awg_die "3proxy is not installed. Run: sudo awg-ui install-3proxy"
+
+  awg_info "Stopping 3proxy.service..."
+  systemctl stop 3proxy.service
+
+  if systemctl is-active --quiet 3proxy.service; then
+    systemctl status 3proxy.service --no-pager || true
+    awg_die "3proxy.service is still active"
+  fi
+
+  awg_info "3proxy.service stopped."
+}
+
+function stop_all_services() {
+  if is_3proxy_installed; then
+    stop_3proxy
+  fi
+  stop_awg
 }
 
 function edit_custom() {
@@ -756,12 +844,30 @@ awg-ui control menu
   4. List allowed IPs
   5. Apply firewall/NAT/geo rules
   6. Restart AmneziaWG
-  7. Restart 3proxy
+EOF
+
+    if is_3proxy_installed; then
+      echo "  7. Restart 3proxy"
+    else
+      echo "  7. Install 3proxy"
+    fi
+
+    cat <<EOF
   8. Geo sync
   9. Geo status
  10. Show custom bypass CIDR
  11. Edit custom bypass CIDR
  12. Help
+ 13. Stop AmneziaWG
+EOF
+
+    if is_3proxy_installed; then
+      echo " 14. Stop 3proxy"
+      echo " 15. Stop all services"
+    fi
+
+    cat <<EOF
+ 16. Geo flush
   0. Exit
 
 EOF
@@ -790,7 +896,11 @@ EOF
         restart_awg
         ;;
       7)
-        restart_3proxy
+        if is_3proxy_installed; then
+          restart_3proxy
+        else
+          install_3proxy_service
+        fi
         ;;
       8)
         geo_update
@@ -807,6 +917,26 @@ EOF
         ;;
       12)
         usage
+        ;;
+      13)
+        stop_awg
+        ;;
+      14)
+        if is_3proxy_installed; then
+          stop_3proxy
+        else
+          awg_warn "Unknown option: ${choice}"
+        fi
+        ;;
+      15)
+        if is_3proxy_installed; then
+          stop_all_services
+        else
+          awg_warn "Unknown option: ${choice}"
+        fi
+        ;;
+      16)
+        geo_flush
         ;;
       0|q|quit|exit)
         return 0
@@ -866,6 +996,18 @@ function main() {
       ;;
     restart)
       restart_awg
+      ;;
+    install-3proxy|proxy-install)
+      install_3proxy_service
+      ;;
+    stop)
+      stop_all_services
+      ;;
+    stop-awg|awg-stop)
+      stop_awg
+      ;;
+    stop-3proxy|proxy-stop)
+      stop_3proxy
       ;;
     restart-3proxy|proxy-restart)
       restart_3proxy
