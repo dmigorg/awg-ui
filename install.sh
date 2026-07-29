@@ -760,16 +760,19 @@ EOF
   {
     echo "net.ipv4.conf.all.rp_filter=0"
     echo "net.ipv4.conf.default.rp_filter=0"
-    echo "net.ipv4.conf.${vpn_if}.rp_filter=0"
-    echo "net.ipv4.conf.${bypass_if}.rp_filter=0"
   } > /etc/sysctl.d/98-amneziawg-rpfilter.conf
 
   sysctl --system >/dev/null
 
-  sysctl -w "net.ipv4.conf.${vpn_if}.forwarding=1" >/dev/null || true
-  sysctl -w "net.ipv4.conf.${bypass_if}.forwarding=1" >/dev/null || true
-  sysctl -w "net.ipv4.conf.${vpn_if}.rp_filter=0" >/dev/null || true
-  sysctl -w "net.ipv4.conf.${bypass_if}.rp_filter=0" >/dev/null || true
+  if [[ -d "/proc/sys/net/ipv4/conf/${vpn_if}" ]]; then
+    sysctl -w "net.ipv4.conf.${vpn_if}.forwarding=1" >/dev/null
+    sysctl -w "net.ipv4.conf.${vpn_if}.rp_filter=0" >/dev/null
+  fi
+
+  if [[ -d "/proc/sys/net/ipv4/conf/${bypass_if}" ]]; then
+    sysctl -w "net.ipv4.conf.${bypass_if}.forwarding=1" >/dev/null
+    sysctl -w "net.ipv4.conf.${bypass_if}.rp_filter=0" >/dev/null
+  fi
 }
 AWG_COMMON_EOF
   chmod 644 "${AWGUI_COMMON}"
@@ -1118,15 +1121,19 @@ EOF
   {
     echo "net.ipv4.conf.all.rp_filter=0"
     echo "net.ipv4.conf.default.rp_filter=0"
-    echo "net.ipv4.conf.${AWGUI_LAN_IF}.rp_filter=0"
-    echo "net.ipv4.conf.${AWGUI_VPN_IF}.rp_filter=0"
   } > /etc/sysctl.d/98-amneziawg-rpfilter.conf
 
-  sysctl --system >/dev/null || true
-  sysctl -w "net.ipv4.conf.${AWGUI_LAN_IF}.forwarding=1" >/dev/null || true
-  sysctl -w "net.ipv4.conf.${AWGUI_VPN_IF}.forwarding=1" >/dev/null || true
-  sysctl -w "net.ipv4.conf.${AWGUI_LAN_IF}.rp_filter=0" >/dev/null || true
-  sysctl -w "net.ipv4.conf.${AWGUI_VPN_IF}.rp_filter=0" >/dev/null || true
+  sysctl --system >/dev/null
+
+  if [[ -d "/proc/sys/net/ipv4/conf/${AWGUI_LAN_IF}" ]]; then
+    sysctl -w "net.ipv4.conf.${AWGUI_LAN_IF}.forwarding=1" >/dev/null
+    sysctl -w "net.ipv4.conf.${AWGUI_LAN_IF}.rp_filter=0" >/dev/null
+  fi
+
+  if [[ -d "/proc/sys/net/ipv4/conf/${AWGUI_VPN_IF}" ]]; then
+    sysctl -w "net.ipv4.conf.${AWGUI_VPN_IF}.forwarding=1" >/dev/null
+    sysctl -w "net.ipv4.conf.${AWGUI_VPN_IF}.rp_filter=0" >/dev/null
+  fi
 }
 
 function configure_3proxy() {
