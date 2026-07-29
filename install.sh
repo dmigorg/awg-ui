@@ -54,7 +54,8 @@ else
   NONINTERACTIVE=0
 fi
 
-if SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
+if [[ -n "${BASH_SOURCE[0]:-}" ]] &&
+   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
   :
 else
   SCRIPT_DIR="$(pwd)"
@@ -88,7 +89,7 @@ Local test:
   sudo bash install.sh
 
 GitHub install:
-  sudo bash <(curl -Ls https://raw.githubusercontent.com/dmigorg/awg-ui/main/install.sh)
+  curl -fsSL https://raw.githubusercontent.com/dmigorg/awg-ui/main/install.sh | sudo bash
 
 Environment:
   AWGUI_NONINTERACTIVE=1

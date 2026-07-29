@@ -4,7 +4,7 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source /usr/local/awg-ui/awg-common.sh
 
-readonly AWG_GEO_RULESET_VERSION="2026-06-10-snat-v1"
+readonly AWG_GEO_RULESET_VERSION="2026-07-29-empty-sets-v2"
 
 function usage() {
   cat <<EOF
@@ -318,8 +318,7 @@ function geo_append_nft_elements() {
 
   [[ -f "${file}" ]] || return 0
 
-  grep -Ev '^\s*$|^\s*#' "${file}" \
-    | sed 's/\r$//' \
+  awk '!/^[[:space:]]*($|#)/ { sub(/\r$/, ""); print }' "${file}" \
     | while IFS= read -r line; do
         line="$(echo "${line}" | awk '{print $1}')"
 
@@ -348,6 +347,8 @@ function geo_generate_nft_file() {
   local bypass_if
   local bypass_src
   local vpn_src
+  local ru_elements
+  local custom_elements
 
   vpn_if="$(awg_detect_vpn_if)"
   route_line="$(awg_detect_bypass_route "${vpn_if}")"
@@ -356,6 +357,8 @@ function geo_generate_nft_file() {
   vpn_src="$(geo_detect_vpn_src "${vpn_if}")"
 
   current_hash="$(geo_sources_hash)"
+  ru_elements="$(geo_append_nft_elements "${AWG_RU_WHITELIST_CIDR}")"
+  custom_elements="$(geo_append_nft_elements "${AWG_CUSTOM_CIDR}")"
 
   awg_info "Generating nftables file..."
   awg_info "NFT SNAT: mark ${AWG_FWMARK}, oif ${bypass_if}, ${vpn_src} -> ${bypass_src}"
@@ -367,26 +370,34 @@ table inet ${AWG_NFT_TABLE} {
     type ipv4_addr
     flags interval
     auto-merge
-    elements = {
 EOF
 
-    geo_append_nft_elements "${AWG_RU_WHITELIST_CIDR}"
+    if [[ -n "${ru_elements}" ]]; then
+      cat <<EOF
+    elements = {
+${ru_elements}
+    }
+EOF
+    fi
 
     cat <<EOF
-    }
   }
 
   set ${AWG_NFT_SET_CUSTOM} {
     type ipv4_addr
     flags interval
     auto-merge
-    elements = {
 EOF
 
-    geo_append_nft_elements "${AWG_CUSTOM_CIDR}"
+    if [[ -n "${custom_elements}" ]]; then
+      cat <<EOF
+    elements = {
+${custom_elements}
+    }
+EOF
+    fi
 
     cat <<EOF
-    }
   }
 
   chain mark_prerouting {
