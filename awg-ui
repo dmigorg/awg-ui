@@ -811,6 +811,153 @@ function stop_all_services() {
   stop_awg
 }
 
+function uninstall_all() {
+  local confirmation=""
+  local vpn_if=""
+  local vpn_service=""
+  local package=""
+  local packages=()
+  local num=""
+  local nums=""
+  local service_link=""
+  local source_file=""
+  local rt_tables_tmp=""
+
+  cat <<'EOF'
+
+WARNING: This will completely remove awg-ui from this server, including:
+  - AmneziaWG and 3proxy services and packages
+  - VPN configuration, allow lists, and geo data
+  - firewall, UFW, nftables, and policy-routing rules
+  - awg-ui, AmneziaWG, and 3proxy application files
+  - dedicated logs, runtime data, package cache, and backups
+
+This operation cannot be undone.
+EOF
+
+  read -rp "Continue with complete uninstall? [y/N]: " confirmation
+  case "${confirmation,,}" in
+    y|yes)
+      ;;
+    *)
+      awg_warn "Uninstall cancelled."
+      return 0
+      ;;
+  esac
+
+  vpn_if="$(awg_detect_vpn_if 2>/dev/null || true)"
+  if [[ -n "${vpn_if}" ]]; then
+    vpn_service="awg-quick@${vpn_if}.service"
+  fi
+
+  awg_info "Stopping and disabling services..."
+  if systemctl cat 3proxy.service >/dev/null 2>&1; then
+    systemctl disable --now 3proxy.service >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${vpn_service}" ]]; then
+    systemctl disable --now "${vpn_service}" >/dev/null 2>&1 || true
+  fi
+  for service_link in /etc/systemd/system/multi-user.target.wants/awg-quick@*.service; do
+    [[ -e "${service_link}" ]] || continue
+    systemctl disable --now "$(basename "${service_link}")" >/dev/null 2>&1 || true
+  done
+
+  awg_info "Removing runtime firewall and routing rules..."
+  nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
+
+  while ip rule del pref 10066 2>/dev/null; do :; done
+  while ip rule del pref "${AWG_ROUTE_RULE_PREF}" 2>/dev/null; do :; done
+  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null; do :; done
+  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null; do :; done
+  ip route flush table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null || true
+  ip route flush table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null || true
+  ip route flush cache 2>/dev/null || true
+
+  if command -v iptables >/dev/null 2>&1; then
+    if [[ -n "${vpn_if}" ]] && awg_is_valid_cidr_or_ip "${AWG_LAN_CIDR}"; then
+      firewall_delete_rule nat POSTROUTING -s "${AWG_LAN_CIDR}" -o "${vpn_if}" -j MASQUERADE
+    fi
+    firewall_delete_rule mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  fi
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw_delete_old_rules
+    nums="$(
+      ufw status numbered \
+        | sed -n '/3proxy HTTP\|3proxy SOCKS5/ s/^\[\s*\([0-9]\+\)\].*/\1/p' \
+        | sort -rn
+    )"
+    while IFS= read -r num; do
+      [[ -n "${num}" ]] || continue
+      printf 'y\n' | ufw delete "${num}" >/dev/null
+    done <<< "${nums}"
+    ufw reload >/dev/null 2>&1 || true
+  fi
+
+  if [[ -f /etc/iproute2/rt_tables ]]; then
+    rt_tables_tmp="$(mktemp)"
+    grep -vE "^[[:space:]]*${AWG_ROUTE_TABLE_ID}[[:space:]]+${AWG_ROUTE_TABLE_NAME}([[:space:]]|$)" \
+      /etc/iproute2/rt_tables > "${rt_tables_tmp}" || true
+    install -m 644 -o root -g root "${rt_tables_tmp}" /etc/iproute2/rt_tables
+    rm -f "${rt_tables_tmp}"
+  fi
+
+  awg_info "Removing installed packages..."
+  if command -v dpkg-query >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    for package in amneziawg amneziawg-tools amneziawg-dkms 3proxy; do
+      if dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null | grep -q '^ii'; then
+        packages+=("${package}")
+      fi
+    done
+
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages[@]}" ||
+        awg_warn "Some packages could not be removed. Check apt/dpkg manually."
+    fi
+  fi
+
+  awg_info "Removing application and configuration files..."
+  rm -f /usr/local/bin/3proxy
+  rm -f /etc/systemd/system/3proxy.service
+  rm -f /etc/sysctl.d/98-amneziawg-rpfilter.conf
+  rm -f /etc/sysctl.d/99-amneziawg-forward.conf
+  rm -f /etc/apt/apt.conf.d/99force-ipv4
+
+  for source_file in /etc/apt/sources.list.d/*; do
+    [[ -f "${source_file}" ]] || continue
+    if grep -Fq "ppa.launchpadcontent.net/amnezia/ppa" "${source_file}"; then
+      rm -f "${source_file}"
+    fi
+  done
+
+  rm -f /etc/apt/trusted.gpg.d/*amnezia* /etc/apt/trusted.gpg.d/*Amnezia* 2>/dev/null || true
+  rm -rf -- /etc/3proxy
+  rm -rf -- /var/log/awg-ui
+  rm -rf -- /var/log/amneziawg
+  rm -rf -- /var/log/3proxy
+  rm -rf -- /run/awg-ui
+  rm -rf -- /run/amneziawg
+  rm -rf -- /run/3proxy
+  rm -rf -- /etc/amnezia
+  rm -rf -- /var/lib/awg-ui
+  rm -rf -- /var/lib/dkms/amneziawg
+  rm -rf -- /var/backups/awg-ui
+  rm -f /etc/default/awg-ui
+  rm -f /var/log/awg-ui-install.log /var/log/awg-ui*.log
+  rm -f /var/cache/apt/archives/amneziawg*.deb
+  rm -f /var/cache/apt/archives/3proxy*.deb
+  rm -f /var/lib/apt/lists/*amnezia*
+
+  systemctl daemon-reload
+
+  rm -rf -- /usr/local/awg-ui
+  rm -f /usr/bin/awg-ui
+
+  echo
+  awg_info "awg-ui, AmneziaWG, 3proxy, and all managed files were removed."
+  exit 0
+}
+
 function edit_custom() {
   awg_prepare_dirs
 
@@ -868,6 +1015,7 @@ EOF
 
     cat <<EOF
  16. Geo flush
+ 17. Completely uninstall awg-ui
   0. Exit
 
 EOF
@@ -937,6 +1085,9 @@ EOF
         ;;
       16)
         geo_flush
+        ;;
+      17)
+        uninstall_all
         ;;
       0|q|quit|exit)
         return 0
