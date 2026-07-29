@@ -1,15 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # shellcheck disable=SC1091
 source /usr/local/awg-ui/awg-common.sh
 
 readonly AWG_GEO_RULESET_VERSION="2026-07-29-empty-sets-v2"
+readonly AWG_OPERATION_LOCK="/run/lock/awg-ui.lock"
+AWG_TEMP_PATHS=()
+
+function cleanup_temp_paths() {
+  local path=""
+
+  for path in "${AWG_TEMP_PATHS[@]}"; do
+    [[ -n "${path}" && "${path}" != "/" ]] || continue
+    rm -rf -- "${path}"
+  done
+}
+
+function create_temp_file() {
+  local target_var="$1"
+  local temp_path=""
+
+  temp_path="$(mktemp)"
+  AWG_TEMP_PATHS+=("${temp_path}")
+  printf -v "${target_var}" '%s' "${temp_path}"
+}
+
+trap cleanup_temp_paths EXIT
+trap 'exit 130' INT TERM
+
+function systemd_unit_exists() {
+  systemctl cat "$1" >/dev/null 2>&1
+}
 
 function is_3proxy_installed() {
   command -v 3proxy >/dev/null 2>&1 &&
     command -v systemctl >/dev/null 2>&1 &&
-    systemctl cat 3proxy.service >/dev/null 2>&1
+    systemd_unit_exists 3proxy.service
+}
+
+function acquire_operation_lock() {
+  awg_require_command flock
+  install -d -m 755 "$(dirname "${AWG_OPERATION_LOCK}")"
+  exec 9>"${AWG_OPERATION_LOCK}"
+  flock -n 9 || awg_die "Another awg-ui installation or uninstall operation is already running"
 }
 
 function usage() {
@@ -65,7 +100,7 @@ function add_ip() {
   if grep -Fxq "${ip}" "${AWG_ALLOW_FILE}"; then
     awg_warn "IP already exists: ${ip}"
   else
-    echo "${ip}" >> "${AWG_ALLOW_FILE}"
+    echo "${ip}" >>"${AWG_ALLOW_FILE}"
     sort -V -u "${AWG_ALLOW_FILE}" -o "${AWG_ALLOW_FILE}"
     chmod 600 "${AWG_ALLOW_FILE}"
     awg_info "Added: ${ip}"
@@ -76,14 +111,15 @@ function add_ip() {
 
 function del_ip() {
   local ip
+  local filtered_file=""
   ip="$(awg_require_ip_arg "${1:-}")"
 
   awg_prepare_dirs
 
   if grep -Fxq "${ip}" "${AWG_ALLOW_FILE}"; then
-    grep -Fxv "${ip}" "${AWG_ALLOW_FILE}" > "${AWG_ALLOW_FILE}.tmp"
-    mv "${AWG_ALLOW_FILE}.tmp" "${AWG_ALLOW_FILE}"
-    chmod 600 "${AWG_ALLOW_FILE}"
+    create_temp_file filtered_file
+    grep -Fxv "${ip}" "${AWG_ALLOW_FILE}" >"${filtered_file}" || true
+    install -m 600 -o root -g root "${filtered_file}" "${AWG_ALLOW_FILE}"
     awg_info "Deleted: ${ip}"
   else
     awg_warn "IP not found: ${ip}"
@@ -105,21 +141,32 @@ function list_ips() {
   nl -ba "${AWG_ALLOW_FILE}"
 }
 
-function ufw_delete_old_rules() {
-  local nums
+function ufw_delete_rules_matching() {
+  local pattern="$1"
+  local num=""
+  local nums=""
 
   nums="$(
-    ufw status numbered \
-      | sed -n "s/^\[\s*\([0-9]\+\)\].*${AWG_UFW_TAG}.*/\1/p" \
-      | sort -rn
+    ufw status numbered |
+      awk -v pattern="${pattern}" '
+          $0 ~ pattern {
+            line = $0
+            sub(/^\[[[:space:]]*/, "", line)
+            sub(/\].*$/, "", line)
+            print line
+          }
+        ' |
+      sort -rn
   )"
-
-  [[ -n "${nums}" ]] || return 0
 
   while IFS= read -r num; do
     [[ -z "${num}" ]] && continue
     printf 'y\n' | ufw delete "${num}" >/dev/null
-  done <<< "${nums}"
+  done <<<"${nums}"
+}
+
+function ufw_delete_old_rules() {
+  ufw_delete_rules_matching "${AWG_UFW_TAG}"
 }
 
 function ufw_sync() {
@@ -132,7 +179,7 @@ function ufw_sync() {
   awg_check_ufw_commands
 
   vpn_if="$(awg_detect_vpn_if)"
-  return_if_file="$(mktemp)"
+  create_temp_file return_if_file
 
   awg_info "Detected VPN interface: ${vpn_if}"
   awg_info "Syncing UFW rules..."
@@ -150,11 +197,11 @@ function ufw_sync() {
 
     lan_if="$(awg_detect_lan_if_for_ip "${ip}")"
 
-    echo "${lan_if}" >> "${return_if_file}"
+    echo "${lan_if}" >>"${return_if_file}"
 
     ufw route allow in on "${lan_if}" out on "${vpn_if}" from "${ip}" comment "${AWG_UFW_TAG} NAT ${ip}" >/dev/null
     ufw route allow in on "${lan_if}" out on "${lan_if}" from "${ip}" comment "${AWG_UFW_TAG} bypass ${ip}" >/dev/null
-  done < "${AWG_ALLOW_FILE}"
+  done <"${AWG_ALLOW_FILE}"
 
   sort -u "${return_if_file}" | while IFS= read -r lan_if; do
     [[ -z "${lan_if}" ]] && continue
@@ -215,18 +262,18 @@ function geo_update() {
 
   curl -fL --retry 5 -o "${AWG_RU_WHITELIST_CIDR}.raw" "${AWG_RU_WHITELIST_URL}"
 
-  grep -Ev '^\s*$|^\s*#' "${AWG_RU_WHITELIST_CIDR}.raw" \
-    | sed 's/\r$//' \
-    | while IFS= read -r line; do
-        line="$(echo "${line}" | awk '{print $1}')"
+  grep -Ev '^\s*$|^\s*#' "${AWG_RU_WHITELIST_CIDR}.raw" |
+    sed 's/\r$//' |
+    while IFS= read -r line; do
+      line="$(echo "${line}" | awk '{print $1}')"
 
-        if awg_is_valid_cidr_or_ip "${line}"; then
-          echo "${line}"
-        else
-          awg_warn "Skip invalid CIDR/IP: ${line}" >&2
-        fi
-      done \
-    | sort -V -u > "${AWG_RU_WHITELIST_CIDR}.tmp"
+      if awg_is_valid_cidr_or_ip "${line}"; then
+        echo "${line}"
+      else
+        awg_warn "Skip invalid CIDR/IP: ${line}" >&2
+      fi
+    done |
+    sort -V -u >"${AWG_RU_WHITELIST_CIDR}.tmp"
 
   mv "${AWG_RU_WHITELIST_CIDR}.tmp" "${AWG_RU_WHITELIST_CIDR}"
   rm -f "${AWG_RU_WHITELIST_CIDR}.raw"
@@ -236,7 +283,7 @@ function geo_update() {
   rm -f "${AWG_NFT_HASH_FILE}"
 
   awg_info "Geo files updated."
-  echo "RU whitelist CIDR count: $(wc -l < "${AWG_RU_WHITELIST_CIDR}")"
+  echo "RU whitelist CIDR count: $(wc -l <"${AWG_RU_WHITELIST_CIDR}")"
 }
 
 function geo_detect_bypass_src() {
@@ -244,9 +291,9 @@ function geo_detect_bypass_src() {
   local bypass_src=""
 
   bypass_src="$(
-    ip -4 addr show dev "${bypass_if}" scope global \
-      | awk '/inet / {print $2; exit}' \
-      | cut -d/ -f1
+    ip -4 addr show dev "${bypass_if}" scope global |
+      awk '/inet / {print $2; exit}' |
+      cut -d/ -f1
   )"
 
   [[ -n "${bypass_src}" ]] || awg_die "Cannot detect source IP for bypass interface: ${bypass_if}"
@@ -259,9 +306,9 @@ function geo_detect_vpn_src() {
   local vpn_src=""
 
   vpn_src="$(
-    ip -4 addr show dev "${vpn_if}" scope global \
-      | awk '/inet / {print $2; exit}' \
-      | cut -d/ -f1
+    ip -4 addr show dev "${vpn_if}" scope global |
+      awk '/inet / {print $2; exit}' |
+      cut -d/ -f1
   )"
 
   [[ -n "${vpn_src}" ]] || awg_die "Cannot detect source IP for VPN interface: ${vpn_if}"
@@ -339,17 +386,17 @@ function geo_append_nft_elements() {
 
   [[ -f "${file}" ]] || return 0
 
-  awk '!/^[[:space:]]*($|#)/ { sub(/\r$/, ""); print }' "${file}" \
-    | while IFS= read -r line; do
-        line="$(echo "${line}" | awk '{print $1}')"
+  awk '!/^[[:space:]]*($|#)/ { sub(/\r$/, ""); print }' "${file}" |
+    while IFS= read -r line; do
+      line="$(echo "${line}" | awk '{print $1}')"
 
-        if awg_is_valid_cidr_or_ip "${line}"; then
-          echo "      ${line},"
-        else
-          awg_warn "Skip invalid CIDR/IP in ${file}: ${line}" >&2
-        fi
-      done \
-    | sort -V -u
+      if awg_is_valid_cidr_or_ip "${line}"; then
+        echo "      ${line},"
+      else
+        awg_warn "Skip invalid CIDR/IP in ${file}: ${line}" >&2
+      fi
+    done |
+    sort -V -u
 }
 
 function geo_generate_nft_file() {
@@ -442,18 +489,14 @@ EOF
   }
 }
 EOF
-  } > "${AWG_NFT_FILE}"
+  } >"${AWG_NFT_FILE}"
 
   chmod 600 "${AWG_NFT_FILE}"
-  echo "${current_hash}" > "${AWG_NFT_HASH_FILE}"
+  echo "${current_hash}" >"${AWG_NFT_HASH_FILE}"
   chmod 600 "${AWG_NFT_HASH_FILE}"
 }
 
-function geo_flush() {
-  awg_check_geo_commands
-
-  nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
-
+function geo_clear_policy_rules() {
   while ip rule del pref 10066 2>/dev/null; do
     :
   done
@@ -469,10 +512,20 @@ function geo_flush() {
   while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null; do
     :
   done
+}
 
+function geo_clear_policy_routing() {
+  geo_clear_policy_rules
   ip route flush table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null || true
   ip route flush table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null || true
   ip route flush cache 2>/dev/null || true
+}
+
+function geo_flush() {
+  awg_check_geo_commands
+
+  nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
+  geo_clear_policy_routing
 
   rm -f "${AWG_NFT_HASH_FILE}"
 
@@ -515,21 +568,7 @@ function geo_apply_policy_route() {
     ip route replace default dev "${bypass_if}" src "${bypass_src}" table "${AWG_ROUTE_TABLE_NAME}"
   fi
 
-  while ip rule del pref 10066 2>/dev/null; do
-    :
-  done
-
-  while ip rule del pref "${AWG_ROUTE_RULE_PREF}" 2>/dev/null; do
-    :
-  done
-
-  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null; do
-    :
-  done
-
-  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null; do
-    :
-  done
+  geo_clear_policy_rules
 
   ip rule add pref "${AWG_ROUTE_RULE_PREF}" fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}"
 
@@ -811,67 +850,32 @@ function stop_all_services() {
   stop_awg
 }
 
-function uninstall_all() {
-  local confirmation=""
-  local vpn_if=""
-  local vpn_service=""
-  local package=""
-  local packages=()
-  local num=""
-  local nums=""
+function uninstall_stop_services() {
+  local vpn_service="$1"
   local service_link=""
-  local source_file=""
-  local rt_tables_tmp=""
-
-  cat <<'EOF'
-
-WARNING: This will completely remove awg-ui from this server, including:
-  - AmneziaWG and 3proxy services and packages
-  - VPN configuration, allow lists, and geo data
-  - firewall, UFW, nftables, and policy-routing rules
-  - awg-ui, AmneziaWG, and 3proxy application files
-  - dedicated logs, runtime data, package cache, and backups
-
-This operation cannot be undone.
-EOF
-
-  read -rp "Continue with complete uninstall? [y/N]: " confirmation
-  case "${confirmation,,}" in
-    y|yes)
-      ;;
-    *)
-      awg_warn "Uninstall cancelled."
-      return 0
-      ;;
-  esac
-
-  vpn_if="$(awg_detect_vpn_if 2>/dev/null || true)"
-  if [[ -n "${vpn_if}" ]]; then
-    vpn_service="awg-quick@${vpn_if}.service"
-  fi
 
   awg_info "Stopping and disabling services..."
-  if systemctl cat 3proxy.service >/dev/null 2>&1; then
+  if systemd_unit_exists 3proxy.service; then
     systemctl disable --now 3proxy.service >/dev/null 2>&1 || true
   fi
   if [[ -n "${vpn_service}" ]]; then
     systemctl disable --now "${vpn_service}" >/dev/null 2>&1 || true
   fi
   for service_link in /etc/systemd/system/multi-user.target.wants/awg-quick@*.service; do
-    [[ -e "${service_link}" ]] || continue
+    [[ -e "${service_link}" || -L "${service_link}" ]] || continue
     systemctl disable --now "$(basename "${service_link}")" >/dev/null 2>&1 || true
   done
+}
+
+function uninstall_runtime_rules() {
+  local vpn_if="$1"
+  local rt_tables_tmp=""
 
   awg_info "Removing runtime firewall and routing rules..."
-  nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
-
-  while ip rule del pref 10066 2>/dev/null; do :; done
-  while ip rule del pref "${AWG_ROUTE_RULE_PREF}" 2>/dev/null; do :; done
-  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null; do :; done
-  while ip rule del fwmark "${AWG_FWMARK}" table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null; do :; done
-  ip route flush table "${AWG_ROUTE_TABLE_NAME}" 2>/dev/null || true
-  ip route flush table "${AWG_ROUTE_TABLE_ID}" 2>/dev/null || true
-  ip route flush cache 2>/dev/null || true
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet "${AWG_NFT_TABLE}" 2>/dev/null || true
+  fi
+  geo_clear_policy_routing
 
   if command -v iptables >/dev/null 2>&1; then
     if [[ -n "${vpn_if}" ]] && awg_is_valid_cidr_or_ip "${AWG_LAN_CIDR}"; then
@@ -881,26 +885,22 @@ EOF
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    ufw_delete_old_rules
-    nums="$(
-      ufw status numbered \
-        | sed -n '/3proxy HTTP\|3proxy SOCKS5/ s/^\[\s*\([0-9]\+\)\].*/\1/p' \
-        | sort -rn
-    )"
-    while IFS= read -r num; do
-      [[ -n "${num}" ]] || continue
-      printf 'y\n' | ufw delete "${num}" >/dev/null
-    done <<< "${nums}"
+    ufw_delete_rules_matching "${AWG_UFW_TAG}|3proxy HTTP|3proxy SOCKS5"
     ufw reload >/dev/null 2>&1 || true
   fi
 
   if [[ -f /etc/iproute2/rt_tables ]]; then
-    rt_tables_tmp="$(mktemp)"
+    create_temp_file rt_tables_tmp
     grep -vE "^[[:space:]]*${AWG_ROUTE_TABLE_ID}[[:space:]]+${AWG_ROUTE_TABLE_NAME}([[:space:]]|$)" \
-      /etc/iproute2/rt_tables > "${rt_tables_tmp}" || true
+      /etc/iproute2/rt_tables >"${rt_tables_tmp}" || true
     install -m 644 -o root -g root "${rt_tables_tmp}" /etc/iproute2/rt_tables
     rm -f "${rt_tables_tmp}"
   fi
+}
+
+function uninstall_packages() {
+  local package=""
+  local packages=()
 
   awg_info "Removing installed packages..."
   if command -v dpkg-query >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -915,6 +915,10 @@ EOF
         awg_warn "Some packages could not be removed. Check apt/dpkg manually."
     fi
   fi
+}
+
+function uninstall_files() {
+  local source_file=""
 
   awg_info "Removing application and configuration files..."
   rm -f /usr/local/bin/3proxy
@@ -948,13 +952,55 @@ EOF
   rm -f /var/cache/apt/archives/3proxy*.deb
   rm -f /var/lib/apt/lists/*amnezia*
 
-  systemctl daemon-reload
+  systemctl daemon-reload >/dev/null
 
   rm -rf -- /usr/local/awg-ui
   rm -f /usr/bin/awg-ui
+}
+
+function uninstall_all() {
+  local confirmation=""
+  local vpn_if=""
+  local vpn_service=""
+
+  cat <<'EOF'
+
+WARNING: This will completely remove awg-ui from this server, including:
+  - AmneziaWG and 3proxy services and packages
+  - VPN configuration, allow lists, and geo data
+  - firewall, UFW, nftables, and policy-routing rules
+  - awg-ui, AmneziaWG, and 3proxy application files
+  - dedicated logs, runtime data, package cache, and backups
+
+This operation cannot be undone.
+EOF
+
+  read -rp "Continue with complete uninstall? [y/N]: " confirmation
+  case "${confirmation,,}" in
+    y | yes)
+      ;;
+    *)
+      awg_warn "Uninstall cancelled."
+      return 0
+      ;;
+  esac
+
+  acquire_operation_lock
+
+  vpn_if="$(awg_detect_vpn_if 2>/dev/null || true)"
+  if [[ -n "${vpn_if}" ]]; then
+    vpn_service="awg-quick@${vpn_if}.service"
+  fi
+
+  uninstall_stop_services "${vpn_service}"
+  uninstall_runtime_rules "${vpn_if}"
+  uninstall_packages
+  uninstall_files
 
   echo
   awg_info "awg-ui, AmneziaWG, 3proxy, and all managed files were removed."
+  flock -u 9
+  rm -f "${AWG_OPERATION_LOCK}"
   exit 0
 }
 
@@ -1008,7 +1054,7 @@ EOF
       4)
         stop_all_services
         ;;
-      0|q|quit|exit)
+      0 | q | quit | exit)
         return 0
         ;;
       *)
@@ -1123,7 +1169,7 @@ EOF
       15)
         uninstall_all
         ;;
-      0|q|quit|exit)
+      0 | q | quit | exit)
         return 0
         ;;
       *)
@@ -1137,9 +1183,16 @@ EOF
 }
 
 function main() {
-  awg_require_root "$@"
-
   local command="${1:-menu}"
+
+  case "${command}" in
+    help | -h | --help)
+      usage
+      return 0
+      ;;
+  esac
+
+  awg_require_root "$@"
 
   case "${command}" in
     menu)
@@ -1148,13 +1201,13 @@ function main() {
     add)
       add_ip "${2:-}"
       ;;
-    del|delete|remove)
+    del | delete | remove)
       del_ip "${2:-}"
       ;;
     list)
       list_ips
       ;;
-    sync|ufw-sync)
+    sync | ufw-sync)
       ufw_sync
       ;;
     geo-update)
@@ -1182,26 +1235,23 @@ function main() {
     restart)
       restart_awg
       ;;
-    install-3proxy|proxy-install)
+    install-3proxy | proxy-install)
       install_3proxy_service
       ;;
     stop)
       stop_all_services
       ;;
-    stop-awg|awg-stop)
+    stop-awg | awg-stop)
       stop_awg
       ;;
-    stop-3proxy|proxy-stop)
+    stop-3proxy | proxy-stop)
       stop_3proxy
       ;;
-    restart-3proxy|proxy-restart)
+    restart-3proxy | proxy-restart)
       restart_3proxy
       ;;
     status)
       status_all
-      ;;
-    help|-h|--help)
-      usage
       ;;
     *)
       usage

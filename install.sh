@@ -10,6 +10,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 set -euo pipefail
+umask 077
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -23,6 +24,7 @@ AWGUI_INSTALLER="${AWGUI_APP_DIR}/install.sh"
 AWGUI_CLI_SOURCE="${AWGUI_APP_DIR}/awg-ui"
 AWGUI_CLI="/usr/bin/awg-ui"
 AWGUI_LOG="/var/log/awg-ui-install.log"
+AWGUI_OPERATION_LOCK="/run/lock/awg-ui.lock"
 
 AWGUI_DIR="/etc/amnezia"
 AWGUI_CONFIG_DIR="/etc/amnezia/amneziawg"
@@ -51,6 +53,7 @@ AWGUI_SOURCE_BASE_URL="${AWGUI_SOURCE_BASE_URL:-}"
 AWGUI_3PROXY_VERSION="${AWGUI_3PROXY_VERSION:-0.9.5}"
 AWGUI_KEEP_EXISTING_CONFIG=0
 AWGUI_PASTE_CONFIG=0
+AWGUI_TEMP_PATHS=()
 
 AWGUI_INPUT_DEVICE="/dev/stdin"
 if [[ -t 2 ]] && [[ -r /dev/tty ]]; then
@@ -58,31 +61,72 @@ if [[ -t 2 ]] && [[ -r /dev/tty ]]; then
 fi
 
 if [[ "${AWGUI_NONINTERACTIVE:-0}" == "1" ]] ||
-   { [[ "${AWGUI_INPUT_DEVICE}" != "/dev/tty" ]] && [[ ! -t 0 ]]; }; then
+  { [[ "${AWGUI_INPUT_DEVICE}" != "/dev/tty" ]] && [[ ! -t 0 ]]; }; then
   NONINTERACTIVE=1
 else
   NONINTERACTIVE=0
 fi
 
 if [[ -n "${BASH_SOURCE[0]:-}" ]] &&
-   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
   :
 else
   SCRIPT_DIR="$(pwd)"
 fi
 
+function log_message() {
+  local level="$1"
+  shift
+
+  [[ -w "${AWGUI_LOG}" ]] || return 0
+  printf '%s [%s] %s\n' "$(date -Is)" "${level}" "$*" >>"${AWGUI_LOG}" 2>/dev/null || true
+}
+
 function info() {
   echo -e "${green}$*${plain}"
+  log_message INFO "$*"
 }
 
 function warn() {
   echo -e "${yellow}$*${plain}" >&2
+  log_message WARN "$*"
 }
 
 function die() {
   echo -e "${red}ERROR:${plain} $*" >&2
+  log_message ERROR "$*"
   exit 1
 }
+
+function cleanup_temp_paths() {
+  local path=""
+
+  for path in "${AWGUI_TEMP_PATHS[@]}"; do
+    [[ -n "${path}" && "${path}" != "/" ]] || continue
+    rm -rf -- "${path}"
+  done
+}
+
+function create_temp_file() {
+  local target_var="$1"
+  local temp_path=""
+
+  temp_path="$(mktemp)"
+  AWGUI_TEMP_PATHS+=("${temp_path}")
+  printf -v "${target_var}" '%s' "${temp_path}"
+}
+
+function create_temp_dir() {
+  local target_var="$1"
+  local temp_path=""
+
+  temp_path="$(mktemp -d)"
+  AWGUI_TEMP_PATHS+=("${temp_path}")
+  printf -v "${target_var}" '%s' "${temp_path}"
+}
+
+trap cleanup_temp_paths EXIT
+trap 'exit 130' INT TERM
 
 function require_root() {
   [[ "${EUID}" -eq 0 ]] && return 0
@@ -124,6 +168,13 @@ function command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+function acquire_operation_lock() {
+  command_exists flock || die "flock is required to run the installer"
+  install -d -m 755 "$(dirname "${AWGUI_OPERATION_LOCK}")"
+  exec 9>"${AWGUI_OPERATION_LOCK}"
+  flock -n 9 || die "Another awg-ui installation or uninstall operation is already running"
+}
+
 function is_3proxy_installed() {
   command_exists 3proxy &&
     command_exists systemctl &&
@@ -133,7 +184,7 @@ function is_3proxy_installed() {
 function read_user_input() {
   local __var="$1" __prompt="$2" __input
 
-  IFS= read -r -p "${__prompt}" __input < "${AWGUI_INPUT_DEVICE}" ||
+  IFS= read -r -p "${__prompt}" __input <"${AWGUI_INPUT_DEVICE}" ||
     die "Unable to read input from ${AWGUI_INPUT_DEVICE}"
   printf -v "${__var}" '%s' "${__input}"
 }
@@ -163,10 +214,10 @@ function prompt_yes_no() {
   fi
 
   case "${answer,,}" in
-    1|y|yes|true|on)
+    1 | y | yes | true | on)
       printf -v "${__var}" '%s' "1"
       ;;
-    0|n|no|false|off)
+    0 | n | no | false | off)
       printf -v "${__var}" '%s' "0"
       ;;
     *)
@@ -202,7 +253,7 @@ function detect_os() {
   fi
 
   case "${release}" in
-    ubuntu|debian|armbian|linuxmint)
+    ubuntu | debian | armbian | linuxmint)
       ;;
     *)
       if [[ " ${ID_LIKE:-} " == *" debian "* ]] || [[ " ${ID_LIKE:-} " == *" ubuntu "* ]]; then
@@ -221,10 +272,10 @@ function is_ipv4() {
   [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
 
   local a b c d octet
-  IFS='.' read -r a b c d <<< "${ip}"
+  IFS='.' read -r a b c d <<<"${ip}"
   for octet in "$a" "$b" "$c" "$d"; do
     [[ "${octet}" =~ ^[0-9]+$ ]] || return 1
-    (( octet >= 0 && octet <= 255 )) || return 1
+    ((octet >= 0 && octet <= 255)) || return 1
   done
 }
 
@@ -237,7 +288,7 @@ function is_cidr_or_ip() {
   if [[ "${value}" == */* ]]; then
     prefix="${value##*/}"
     [[ "${prefix}" =~ ^[0-9]+$ ]] || return 1
-    (( prefix >= 0 && prefix <= 32 )) || return 1
+    ((prefix >= 0 && prefix <= 32)) || return 1
   fi
 
   is_ipv4 "${ip}"
@@ -251,22 +302,22 @@ function cidr_network() {
 
   is_ipv4 "${ip}" || return 1
   [[ "${prefix}" =~ ^[0-9]+$ ]] || return 1
-  (( prefix >= 0 && prefix <= 32 )) || return 1
+  ((prefix >= 0 && prefix <= 32)) || return 1
 
-  IFS='.' read -r o1 o2 o3 o4 <<< "${ip}"
-  ip_int=$(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
-  if (( prefix == 0 )); then
+  IFS='.' read -r o1 o2 o3 o4 <<<"${ip}"
+  ip_int=$(((o1 << 24) + (o2 << 16) + (o3 << 8) + o4))
+  if ((prefix == 0)); then
     mask=0
   else
-    mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
+    mask=$(((0xffffffff << (32 - prefix)) & 0xffffffff))
   fi
-  network=$(( ip_int & mask ))
+  network=$((ip_int & mask))
 
   printf '%d.%d.%d.%d/%d\n' \
-    $(( (network >> 24) & 255 )) \
-    $(( (network >> 16) & 255 )) \
-    $(( (network >> 8) & 255 )) \
-    $(( network & 255 )) \
+    $(((network >> 24) & 255)) \
+    $(((network >> 16) & 255)) \
+    $(((network >> 8) & 255)) \
+    $((network & 255)) \
     "${prefix}"
 }
 
@@ -337,15 +388,17 @@ function install_base_packages() {
   fi
 
   if [[ "${AWGUI_FORCE_IPV4_APT}" == "1" ]]; then
-    echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+    echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4
   fi
 
   info "Installing base packages..."
   apt-get update
-  apt-get install -y -q "${packages[@]}"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${packages[@]}"
 
   if ! dpkg -l | grep -q "linux-headers-$(uname -r)"; then
-    apt-get install -y -q "linux-headers-$(uname -r)" || apt-get install -y -q linux-headers-generic || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-headers-$(uname -r)" ||
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-headers-generic ||
+      true
   fi
 }
 
@@ -358,7 +411,7 @@ function install_amneziawg() {
   info "Installing AmneziaWG..."
   add-apt-repository -y ppa:amnezia/ppa
   apt-get update
-  apt-get install -y -q amneziawg
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q amneziawg
   modprobe amneziawg 2>/dev/null || true
 
   command_exists awg || die "awg command not found after install"
@@ -373,12 +426,12 @@ function install_3proxy() {
 
   if apt-cache show 3proxy >/dev/null 2>&1; then
     info "Installing 3proxy from apt..."
-    apt-get install -y -q 3proxy
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q 3proxy
   else
     info "3proxy package is not available in apt. Building 3proxy ${AWGUI_3PROXY_VERSION} from source..."
 
     local build_dir
-    build_dir="$(mktemp -d)"
+    create_temp_dir build_dir
 
     curl -fL --retry 5 \
       -o "${build_dir}/3proxy.tar.gz" \
@@ -387,7 +440,11 @@ function install_3proxy() {
     mkdir -p "${build_dir}/src"
     tar -xzf "${build_dir}/3proxy.tar.gz" -C "${build_dir}/src" --strip-components=1
 
-    make -C "${build_dir}/src" -f Makefile.Linux
+    if ! make -C "${build_dir}/src" -f Makefile.Linux >"${build_dir}/build.log" 2>&1; then
+      warn "3proxy build failed. Last build log lines:"
+      tail -n 80 "${build_dir}/build.log" >&2 || true
+      die "Cannot build 3proxy ${AWGUI_3PROXY_VERSION}"
+    fi
     install -m 755 -o root -g root "${build_dir}/src/bin/3proxy" /usr/local/bin/3proxy
 
     rm -rf "${build_dir}"
@@ -434,7 +491,7 @@ function write_awg_common_file() {
   info "Writing ${AWGUI_COMMON}..."
 
   backup_file "${AWGUI_COMMON}"
-  cat > "${AWGUI_COMMON}" <<'AWG_COMMON_EOF'
+  cat >"${AWGUI_COMMON}" <<'AWG_COMMON_EOF'
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
 
@@ -456,7 +513,7 @@ readonly AWG_CUSTOM_CIDR="/etc/amnezia/custom-geo.cidr"
 readonly AWG_ENV_FILE="/etc/default/awg-ui"
 readonly AWG_INSTALLER="/usr/local/awg-ui/install.sh"
 
-if [[ -f "${AWG_ENV_FILE}" ]]; then
+if [[ -r "${AWG_ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${AWG_ENV_FILE}"
 fi
@@ -770,6 +827,7 @@ EOF
     echo "net.ipv4.conf.all.rp_filter=0"
     echo "net.ipv4.conf.default.rp_filter=0"
   } > /etc/sysctl.d/98-amneziawg-rpfilter.conf
+  chmod 644 /etc/sysctl.d/98-amneziawg-rpfilter.conf /etc/sysctl.d/99-amneziawg-forward.conf
 
   sysctl --system >/dev/null
 
@@ -789,10 +847,11 @@ AWG_COMMON_EOF
 }
 
 function install_awg_ui_files() {
-  local cli_temp="/usr/bin/awg-ui-temp.$$"
-  local installer_temp="${AWGUI_APP_DIR}/install.sh.tmp.$$"
-  rm -f "${cli_temp}"
-  rm -f "${installer_temp}"
+  local cli_temp=""
+  local installer_temp=""
+
+  create_temp_file cli_temp
+  create_temp_file installer_temp
 
   fetch_source_file "awg-ui" "${cli_temp}"
   fetch_source_file "install.sh" "${installer_temp}"
@@ -817,7 +876,7 @@ function install_awg_ui_files() {
   mv -f "${cli_temp}" "${AWGUI_CLI}"
   install -m 700 -o root -g root "${AWGUI_CLI}" "${AWGUI_CLI_SOURCE}"
   mv -f "${installer_temp}" "${AWGUI_INSTALLER}"
-  chmod 700 "${AWGUI_CLI}"
+  chmod 755 "${AWGUI_CLI}"
   chmod 700 "${AWGUI_INSTALLER}"
   write_awg_common_file
 
@@ -837,7 +896,18 @@ function validate_awg_config_file() {
 
   [[ -s "${config}" ]] || die "AWG config is empty: ${config}"
   grep -Eq '^[[:space:]]*\[Interface\][[:space:]]*$' "${config}" || die "AWG config must contain [Interface]: ${config}"
-  grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${config}" || die "AWG config must contain Interface PrivateKey: ${config}"
+  awk '
+    /^[[:space:]]*\[/ {
+      in_interface = ($0 ~ /^[[:space:]]*\[Interface\][[:space:]]*$/)
+    }
+    in_interface && /^[[:space:]]*PrivateKey[[:space:]]*=/ {
+      found = 1
+      exit
+    }
+    END {
+      exit(found ? 0 : 1)
+    }
+  ' "${config}" || die "AWG config must contain PrivateKey inside [Interface]: ${config}"
 }
 
 function choose_awg_config_source() {
@@ -849,8 +919,8 @@ function choose_awg_config_source() {
   fi
 
   if [[ -n "${AWGUI_CONFIG_FILE:-}" ]] ||
-     [[ -n "${AWGUI_CONFIG_URL:-}" ]] ||
-     [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
+    [[ -n "${AWGUI_CONFIG_URL:-}" ]] ||
+    [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
     return 0
   fi
 
@@ -961,7 +1031,7 @@ function install_config_from_env() {
 
   if [[ -n "${AWGUI_CONFIG_URL:-}" ]]; then
     command_exists curl || die "curl is required to download AWGUI_CONFIG_URL: ${AWGUI_CONFIG_URL}"
-    tmp="$(mktemp)"
+    create_temp_file tmp
     if ! curl -fL --retry 5 -o "${tmp}" "${AWGUI_CONFIG_URL}"; then
       rm -f "${tmp}"
       die "Cannot download AWG config from URL: ${AWGUI_CONFIG_URL}"
@@ -972,8 +1042,8 @@ function install_config_from_env() {
   fi
 
   if [[ -n "${AWGUI_CONFIG_TEXT:-}" ]]; then
-    tmp="$(mktemp)"
-    printf '%s\n' "${AWGUI_CONFIG_TEXT}" > "${tmp}"
+    create_temp_file tmp
+    printf '%s\n' "${AWGUI_CONFIG_TEXT}" >"${tmp}"
     install_validated_config "${tmp}"
     rm -f "${tmp}"
     return 0
@@ -989,34 +1059,21 @@ function paste_awg_config_if_missing() {
   fi
 
   if [[ "${AWGUI_PASTE_CONFIG}" != "1" ]] &&
-     compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
+    compgen -G "${AWGUI_CONFIG_DIR}/*.conf" >/dev/null; then
     return 0
   fi
 
   [[ "${NONINTERACTIVE}" != "1" ]] || die "No AWG config found. Set AWGUI_CONFIG_FILE, AWGUI_CONFIG_URL, or AWGUI_CONFIG_TEXT."
 
   info "Paste AmneziaWG config for ${AWGUI_VPN_IF}. Finish with a line containing only EOF."
-  tmp="$(mktemp)"
+  create_temp_file tmp
 
   while IFS= read -r line; do
     [[ "${line}" == "EOF" ]] && break
-    printf '%s\n' "${line}" >> "${tmp}"
-  done < "${AWGUI_INPUT_DEVICE}"
+    printf '%s\n' "${line}" >>"${tmp}"
+  done <"${AWGUI_INPUT_DEVICE}"
 
-  [[ -s "${tmp}" ]] || {
-    rm -f "${tmp}"
-    die "Pasted AWG config is empty"
-  }
-
-  grep -Eq '^[[:space:]]*\[Interface\][[:space:]]*$' "${tmp}" || {
-    rm -f "${tmp}"
-    die "Pasted AWG config must contain [Interface]"
-  }
-
-  grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${tmp}" || {
-    rm -f "${tmp}"
-    die "Pasted AWG config must contain Interface PrivateKey"
-  }
+  validate_awg_config_file "${tmp}"
 
   backup_file "${server_config}"
   install -m 600 -o root -g root "${tmp}" "${server_config}"
@@ -1041,7 +1098,7 @@ function detect_listen_port_from_config() {
 
   if [[ -n "${detected}" ]]; then
     [[ "${detected}" =~ ^[0-9]+$ ]] || die "Invalid ListenPort in ${config}: ${detected}"
-    (( detected >= 1 && detected <= 65535 )) || die "Invalid ListenPort in ${config}: ${detected}"
+    ((detected >= 1 && detected <= 65535)) || die "Invalid ListenPort in ${config}: ${detected}"
     AWGUI_LISTEN_PORT="${detected}"
   fi
 }
@@ -1078,21 +1135,21 @@ function prepare_config_hooks() {
   backup_file "${config}"
 
   if ! grep -Fxq "PostUp = ${AWGUI_CLI} apply" "${config}"; then
-    tmp="$(mktemp)"
+    create_temp_file tmp
     awk -v hook="PostUp = /usr/bin/awg-ui apply" '
       /^[[:space:]]*\[Interface\][[:space:]]*$/ && !done { print; print hook; done=1; next }
       { print }
-    ' "${config}" > "${tmp}"
+    ' "${config}" >"${tmp}"
     install -m 600 -o root -g root "${tmp}" "${config}"
     rm -f "${tmp}"
   fi
 
   if ! grep -Fxq "PreDown = ${AWGUI_CLI} geo-flush" "${config}"; then
-    tmp="$(mktemp)"
+    create_temp_file tmp
     awk -v hook="PreDown = /usr/bin/awg-ui geo-flush" '
       /^[[:space:]]*\[Interface\][[:space:]]*$/ && !done { print; print hook; done=1; next }
       { print }
-    ' "${config}" > "${tmp}"
+    ' "${config}" >"${tmp}"
     install -m 600 -o root -g root "${tmp}" "${config}"
     rm -f "${tmp}"
   fi
@@ -1102,7 +1159,7 @@ function write_env_file() {
   info "Writing ${AWGUI_ENV_FILE}..."
 
   backup_file "${AWGUI_ENV_FILE}"
-  cat > "${AWGUI_ENV_FILE}" <<EOF
+  cat >"${AWGUI_ENV_FILE}" <<EOF
 AWG_LAN_CIDR="${AWGUI_LAN_CIDR}"
 AWG_LAN_IF="${AWGUI_LAN_IF}"
 EOF
@@ -1135,7 +1192,7 @@ function configure_sysctl() {
   backup_file /etc/sysctl.d/99-amneziawg-forward.conf
   backup_file /etc/sysctl.d/98-amneziawg-rpfilter.conf
 
-  cat > /etc/sysctl.d/99-amneziawg-forward.conf <<'EOF'
+  cat >/etc/sysctl.d/99-amneziawg-forward.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.forwarding=1
 net.ipv4.conf.default.forwarding=1
@@ -1144,7 +1201,8 @@ EOF
   {
     echo "net.ipv4.conf.all.rp_filter=0"
     echo "net.ipv4.conf.default.rp_filter=0"
-  } > /etc/sysctl.d/98-amneziawg-rpfilter.conf
+  } >/etc/sysctl.d/98-amneziawg-rpfilter.conf
+  chmod 644 /etc/sysctl.d/98-amneziawg-rpfilter.conf /etc/sysctl.d/99-amneziawg-forward.conf
 
   sysctl --system >/dev/null
 
@@ -1175,7 +1233,7 @@ function configure_3proxy() {
   install -d -m 755 /var/log/3proxy
 
   backup_file /etc/3proxy/3proxy.cfg
-  cat > /etc/3proxy/3proxy.cfg <<EOF
+  cat >/etc/3proxy/3proxy.cfg <<EOF
 nserver ${AWGUI_DNS_1}
 nserver ${AWGUI_DNS_2}
 nscache 65536
@@ -1194,9 +1252,10 @@ allow * ${AWGUI_LAN_CIDR}
 proxy -p${AWGUI_HTTP_PORT}
 socks -p${AWGUI_SOCKS_PORT}
 EOF
+  chmod 600 /etc/3proxy/3proxy.cfg
 
   backup_file /etc/systemd/system/3proxy.service
-  cat > /etc/systemd/system/3proxy.service <<EOF
+  cat >/etc/systemd/system/3proxy.service <<EOF
 [Unit]
 Description=3proxy proxy server
 After=network-online.target awg-quick@${AWGUI_VPN_IF}.service
@@ -1216,6 +1275,7 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 /etc/systemd/system/3proxy.service
 }
 
 function configure_ufw() {
@@ -1237,7 +1297,7 @@ function configure_ufw() {
   if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
     sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw
   else
-    echo 'DEFAULT_FORWARD_POLICY="DROP"' >> /etc/default/ufw
+    echo 'DEFAULT_FORWARD_POLICY="DROP"' >>/etc/default/ufw
   fi
 
   ufw --force enable >/dev/null
@@ -1316,7 +1376,7 @@ function print_summary() {
 
 function main() {
   case "${1:-}" in
-    --help|-h|help)
+    --help | -h | help)
       usage
       return 0
       ;;
@@ -1324,6 +1384,7 @@ function main() {
 
   echo "Starting awg-ui installer..."
   require_root
+  acquire_operation_lock
   init_log
   info "Log file: ${AWGUI_LOG}"
   print_source_hint
