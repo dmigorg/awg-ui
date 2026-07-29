@@ -976,6 +976,51 @@ function edit_custom() {
   geo_apply
 }
 
+function show_3proxy_menu() {
+  local choice=""
+
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+╔══════════════════════════════════════════════════════╗
+║  3proxy Management                                   ║
+║  0. Back to main menu                                ║
+╠══════════════════════════════════════════════════════╣
+║  1. Status                                           ║
+║  2. Restart                                          ║
+║  3. Stop                                             ║
+║  4. Stop 3proxy and AmneziaWG                        ║
+╚══════════════════════════════════════════════════════╝
+EOF
+
+    read -rp "Choose an option [0-4]: " choice
+
+    case "${choice}" in
+      1)
+        systemctl status 3proxy.service --no-pager || true
+        ;;
+      2)
+        restart_3proxy
+        ;;
+      3)
+        stop_3proxy
+        ;;
+      4)
+        stop_all_services
+        ;;
+      0|q|quit|exit)
+        return 0
+        ;;
+      *)
+        awg_warn "Unknown option: ${choice}"
+        ;;
+    esac
+
+    echo
+    read -rp "Press Enter to continue..." _
+  done
+}
+
 function show_menu() {
   local choice
   local ip
@@ -983,110 +1028,99 @@ function show_menu() {
   while true; do
     clear 2>/dev/null || true
     cat <<EOF
-awg-ui control menu
-===================
-  1. Status
-  2. Add allowed IP
-  3. Delete allowed IP
-  4. List allowed IPs
-  5. Apply firewall/NAT/geo rules
-  6. Restart AmneziaWG
+╔══════════════════════════════════════════════════════╗
+║  awg-ui Control Menu                                 ║
+║  0. Exit                                             ║
+╠══════════════════════════════════════════════════════╣
+║  STATUS AND RULES                                    ║
+║  1. Status                                           ║
+║  2. Apply firewall, NAT, and geo rules               ║
+╠══════════════════════════════════════════════════════╣
+║  ALLOWED IP ADDRESSES                                ║
+║  3. List allowed IPs                                 ║
+║  4. Add allowed IP                                   ║
+║  5. Delete allowed IP                                ║
+╠══════════════════════════════════════════════════════╣
+║  SERVICES                                            ║
+║  6. Restart AmneziaWG                                ║
+║  7. Stop AmneziaWG                                   ║
 EOF
 
     if is_3proxy_installed; then
-      echo "  7. Restart 3proxy"
+      echo "║  8. 3proxy management                                ║"
     else
-      echo "  7. Install 3proxy"
+      echo "║  8. Install 3proxy                                   ║"
     fi
 
     cat <<EOF
-  8. Geo sync
-  9. Geo status
- 10. Show custom bypass CIDR
- 11. Edit custom bypass CIDR
- 12. Help
- 13. Stop AmneziaWG
+╠══════════════════════════════════════════════════════╣
+║  GEO BYPASS                                          ║
+║  9. Sync geo data and apply rules                    ║
+║ 10. Geo status                                       ║
+║ 11. Flush geo rules                                  ║
+║ 12. Show custom bypass CIDR                          ║
+║ 13. Edit custom bypass CIDR                          ║
+╠══════════════════════════════════════════════════════╣
+║  MAINTENANCE                                         ║
+║ 14. Help                                             ║
+║ 15. Completely uninstall awg-ui                      ║
+╚══════════════════════════════════════════════════════╝
 EOF
 
-    if is_3proxy_installed; then
-      echo " 14. Stop 3proxy"
-      echo " 15. Stop all services"
-    fi
-
-    cat <<EOF
- 16. Geo flush
- 17. Completely uninstall awg-ui
-  0. Exit
-
-EOF
-
-    read -rp "Choose an option: " choice
+    read -rp "Choose an option [0-15]: " choice
 
     case "${choice}" in
       1)
         status_all
         ;;
       2)
+        apply_all
+        ;;
+      3)
+        list_ips
+        ;;
+      4)
         read -rp "IP to add: " ip
         add_ip "${ip}"
         ;;
-      3)
+      5)
         read -rp "IP to delete: " ip
         del_ip "${ip}"
-        ;;
-      4)
-        list_ips
-        ;;
-      5)
-        apply_all
         ;;
       6)
         restart_awg
         ;;
       7)
+        stop_awg
+        ;;
+      8)
         if is_3proxy_installed; then
-          restart_3proxy
+          show_3proxy_menu
+          continue
         else
           install_3proxy_service
         fi
         ;;
-      8)
+      9)
         geo_update
         geo_apply
         ;;
-      9)
+      10)
         geo_status
         ;;
-      10)
-        show_custom
-        ;;
       11)
-        edit_custom
-        ;;
-      12)
-        usage
-        ;;
-      13)
-        stop_awg
-        ;;
-      14)
-        if is_3proxy_installed; then
-          stop_3proxy
-        else
-          awg_warn "Unknown option: ${choice}"
-        fi
-        ;;
-      15)
-        if is_3proxy_installed; then
-          stop_all_services
-        else
-          awg_warn "Unknown option: ${choice}"
-        fi
-        ;;
-      16)
         geo_flush
         ;;
-      17)
+      12)
+        show_custom
+        ;;
+      13)
+        edit_custom
+        ;;
+      14)
+        usage
+        ;;
+      15)
         uninstall_all
         ;;
       0|q|quit|exit)
